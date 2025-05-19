@@ -8,743 +8,1052 @@
 import Foundation
 import CoreBluetooth
 import Combine
+import UIKit // For alert prompting
 
 public extension FlySightCore {
+
+    // MARK: - Service UUIDs
+    static let FILE_TRANSFER_SERVICE_UUID = CBUUID(string: "00000000-cc7a-482a-984a-7f2ed5b3e58f")
+    static let SENSOR_DATA_SERVICE_UUID   = CBUUID(string: "00000001-cc7a-482a-984a-7f2ed5b3e58f")
+    static let STARTER_PISTOL_SERVICE_UUID = CBUUID(string: "00000002-cc7a-482a-984a-7f2ed5b3e58f")
+    static let DEVICE_STATE_SERVICE_UUID  = CBUUID(string: "00000003-cc7a-482a-984a-7f2ed5b3e58f")
+    // Standard Services
+    static let DEVICE_INFORMATION_SERVICE_UUID = CBUUID(string: "180A")
+    static let BATTERY_SERVICE_UUID           = CBUUID(string: "180F") // Planned
+
+    // MARK: - Characteristic UUIDs (Fully Qualified)
+    // File Transfer Service
+    static let FT_PACKET_OUT_UUID = CBUUID(string: "00000001-8e22-4541-9d4c-21edae82ed19") // Notify
+    static let FT_PACKET_IN_UUID  = CBUUID(string: "00000002-8e22-4541-9d4c-21edae82ed19") // WriteWithoutResponse, Read (Pairing Trigger)
+
+    // Sensor Data Service
+    static let SD_GNSS_MEASUREMENT_UUID = CBUUID(string: "00000000-8e22-4541-9d4c-21edae82ed19") // Read, Notify
+    static let SD_CONTROL_POINT_UUID    = CBUUID(string: "00000006-8e22-4541-9d4c-21edae82ed19") // Write, Indicate
+
+    // Starter Pistol Service
+    static let SP_CONTROL_POINT_UUID = CBUUID(string: "00000003-8e22-4541-9d4c-21edae82ed19") // Write, Indicate
+    static let SP_RESULT_UUID        = CBUUID(string: "00000004-8e22-4541-9d4c-21edae82ed19") // Read, Indicate
+
+    // Device State Service
+    static let DS_MODE_UUID            = CBUUID(string: "00000005-8e22-4541-9d4c-21edae82ed19") // Read, Indicate
+    static let DS_CONTROL_POINT_UUID   = CBUUID(string: "00000007-8e22-4541-9d4c-21edae82ed19") // Write, Indicate
+
+    // Standard Characteristic UUIDs
+    static let FIRMWARE_REVISION_STRING_UUID = CBUUID(string: "2A26")
+
+
     class BluetoothManager: NSObject, ObservableObject {
-        private var centralManager: CBCentralManager?
+        private var centralManager: CBCentralManager! // Implicitly unwrapped after init
         private var cancellables = Set<AnyCancellable>()
         private var notificationHandlers: [CBUUID: (CBPeripheral, CBCharacteristic, Error?) -> Void] = [:]
 
-        @Published public var peripheralInfos: [PeripheralInfo] = []
-
-        public let CRS_RX_UUID = CBUUID(string: "00000002-8e22-4541-9d4c-21edae82ed19")
-        public let CRS_TX_UUID = CBUUID(string: "00000001-8e22-4541-9d4c-21edae82ed19")
-        public let GNSS_PV_UUID = CBUUID(string: "00000000-8e22-4541-9d4c-21edae82ed19")
-        public let START_RESULT_UUID = CBUUID(string: "00000004-8e22-4541-9d4c-21edae82ed19")
-        public let SD_CONTROL_POINT_UUID = CBUUID(string: "00000006-8e22-4541-9d4c-21edae82ed19")
-        public let SP_CONTROL_POINT_UUID = CBUUID(string: "00000003-8e22-4541-9d4c-21edae82ed19")
-
-        private var rxCharacteristic: CBCharacteristic?
-        private var txCharacteristic: CBCharacteristic?
-        private var pvCharacteristic: CBCharacteristic?
-        private var spControlPointCharacteristic: CBCharacteristic?
-        private var resultCharacteristic: CBCharacteristic?
+        // MARK: - Characteristics References
+        private var ftPacketInCharacteristic: CBCharacteristic?
+        private var ftPacketOutCharacteristic: CBCharacteristic?
+        private var sdGNSSMeasurementCharacteristic: CBCharacteristic?
         private var sdControlPointCharacteristic: CBCharacteristic?
+        private var spControlPointCharacteristic: CBCharacteristic?
+        private var spResultCharacteristic: CBCharacteristic?
+        private var dsModeCharacteristic: CBCharacteristic?
+        private var dsControlPointCharacteristic: CBCharacteristic?
+        private var firmwareRevisionCharacteristic: CBCharacteristic?
 
+
+        // MARK: - Published UI State
+        @Published public var knownPeripherals: [PeripheralInfo] = []
+        @Published public var discoveredPairingPeripherals: [PeripheralInfo] = []
+        @Published public var connectedPeripheralInfo: PeripheralInfo? // Wraps the CBPeripheral and associated app state
+        @Published public var connectionState: ConnectionState = .idle
+        @Published public var flysightModelName: String?
+        @Published public var flysightFirmwareVersion: String?
+
+        // File Management
         @Published public var directoryEntries: [DirectoryEntry] = []
+        @Published public var currentPath: [String] = []
+        @Published public var isAwaitingDirectoryResponse = false
 
-        @Published public var connectedPeripheral: PeripheralInfo?
-
-        @Published public var currentPath: [String] = []  // Start with the root directory
-
-        @Published public var isAwaitingResponse = false
-
-        public enum State {
-            case idle
-            case counting
-        }
-
-        @Published public var state: State = .idle
+        // Start Pistol
+        public enum StartPistolState { case idle, counting }
+        @Published public var startPistolState: StartPistolState = .idle
         @Published public var startResultDate: Date?
 
-        private var timers: [UUID: Timer] = [:]
-
+        // Downloads & Uploads
         @Published public var downloadProgress: Float = 0.0
-        private var currentFileSize: UInt32 = 0
-
-        private var isUploading = false
         @Published public var uploadProgress: Float = 0.0
+        private var currentFileSize: UInt32 = 0
+        private var isUploading = false
         private var fileDataToUpload: Data?
         private var remotePathToUpload: String?
-        private var nextPacketNum: Int = 0       // Next packet number to send (full Int)
-        private var nextAckNum: Int = 0          // Next acknowledgment expected
-        private var lastPacketNum: Int?          // Sequence number after the last packet
-        private let windowLength: Int = 8         // Window size
-        private let frameLength: Int = 242        // Size of each data frame
-        private let TX_TIMEOUT: TimeInterval = 0.2 // Timeout for acknowledgments in seconds
-        private var totalPackets: UInt32 = 0      // Total number of packets to send
-        private var uploadTask: Task<Void, Never>? // Task for the main upload loop
-        private var ackReceived = PassthroughSubject<Int, Never>() // Publisher for received ACKs
-        private var uploadCancellable: AnyCancellable?
-        private var continuationCancellables: Set<AnyCancellable> = []
-        private var uploadCompletion: ((Result<Void, Error>) -> Void)?
-
-        // Resumption flag and lock to prevent multiple resumptions
-        private let ackContinuationLock = DispatchQueue(label: "com.flysight.bluetoothmanager.ackContinuationLock")
-        private var isContinuationResumed = false
+        private var nextPacketNum: Int = 0
+        private var nextAckNum: Int = 0
+        private var lastPacketNum: Int?
+        private let windowLength: Int = 8
+        private let frameLength: Int = 242 // As per FlySight docs for FT_Packet_In/Out data part
+        private let txTimeoutInterval: TimeInterval = 0.2 // For GBN sender
+        private var totalPacketsToSend: UInt32 = 0
+        private var uploadContinuation: CheckedContinuation<Void, Error>? // For awaiting upload completion
 
         private var pingTimer: Timer?
 
+        // Live GNSS
         @Published public var liveGNSSData: FlySightCore.LiveGNSSData?
-        @Published public var currentGNSSMask: UInt8 = FlySightCore.GNSSLiveMaskBits.timeOfWeek | FlySightCore.GNSSLiveMaskBits.position | FlySightCore.GNSSLiveMaskBits.velocity // Default: 0xB0
-        @Published public var gnssMaskUpdateStatus: FlySightCore.GNSSMaskUpdateStatus = .idle
-
+        @Published public var currentGNSSMask: UInt8 = GNSSLiveMaskBits.timeOfWeek | GNSSLiveMaskBits.position | GNSSLiveMaskBits.velocity
+        @Published public var gnssMaskUpdateStatus: GNSSMaskUpdateStatus = .idle
         private var lastAttemptedGNSSMask: UInt8?
 
-        public override init() {
-            super.init()
-            self.centralManager = CBCentralManager(delegate: self, queue: .main)
+        // MARK: - Internal State
+        public enum ScanMode { case none, knownDevices, pairingMode }
+        private var currentScanMode: ScanMode = .none
+        private var disappearanceTimers: [UUID: Timer] = [:]
+        private var peripheralBeingConnected: CBPeripheral? // To track during connection process
+
+        private let lastConnectedPeripheralIDKey = "lastConnectedPeripheralID_v1"
+        private var lastConnectedPeripheralID: UUID? {
+            get {
+                guard let uuidString = UserDefaults.standard.string(forKey: lastConnectedPeripheralIDKey) else { return nil }
+                return UUID(uuidString: uuidString)
+            }
+            set {
+                UserDefaults.standard.set(newValue?.uuidString, forKey: lastConnectedPeripheralIDKey)
+            }
         }
 
-        public func sortPeripheralsByRSSI() {
+        public enum ConnectionState: Equatable {
+            case idle // Initial state, or after full disconnect
+            case scanningKnown
+            case scanningPairing
+            case connecting(to: PeripheralInfo) // Contains info about target
+            case discoveringServices(for: CBPeripheral)
+            case discoveringCharacteristics(for: CBPeripheral)
+            case connected(to: PeripheralInfo) // Fully operational
+            case disconnecting(from: PeripheralInfo)
+        }
+
+        // MARK: - Initialization
+        public override init() {
+            super.init()
+            // Initialize CBCentralManager on a background queue for performance.
+            // Delegate methods will be called on this queue, so dispatch to main for UI updates.
+            self.centralManager = CBCentralManager(delegate: self, queue: DispatchQueue.global(qos: .userInitiated))
+            print("BluetoothManager initialized.")
+            // Loading known peripherals and attempting auto-connect will happen in centralManagerDidUpdateState.
+        }
+
+        private func resetPeripheralState() {
             DispatchQueue.main.async {
-                self.peripheralInfos.sort {
-                    // First, sort by pairing mode: true comes before false
-                    if $0.isPairingMode != $1.isPairingMode {
-                        return $0.isPairingMode && !$1.isPairingMode
+                self.connectedPeripheralInfo = nil
+                self.peripheralBeingConnected = nil
+
+                self.ftPacketInCharacteristic = nil
+                self.ftPacketOutCharacteristic = nil
+                self.sdGNSSMeasurementCharacteristic = nil
+                self.sdControlPointCharacteristic = nil
+                self.spControlPointCharacteristic = nil
+                self.spResultCharacteristic = nil
+                self.dsModeCharacteristic = nil
+                self.dsControlPointCharacteristic = nil
+                self.firmwareRevisionCharacteristic = nil
+                self.flysightModelName = nil
+                self.flysightFirmwareVersion = nil
+
+                self.stopPingTimer()
+                self.currentPath = []
+                self.directoryEntries = []
+                self.isAwaitingDirectoryResponse = false
+                self.startPistolState = .idle
+                self.liveGNSSData = nil
+                self.gnssMaskUpdateStatus = .idle
+
+                if self.isUploading {
+                    self.uploadContinuation?.resume(throwing: NSError(domain: "FlySightCore.Upload", code: -100, userInfo: [NSLocalizedDescriptionKey: "Connection lost during upload."]))
+                    self.uploadContinuation = nil
+                    self.isUploading = false
+                    self.uploadProgress = 0.0
+                }
+                // Reset download progress if necessary
+                self.downloadProgress = 0.0
+            }
+        }
+
+        // MARK: - Scanning Control
+        public func startScanningForKnownDevices() {
+            guard centralManager.state == .poweredOn else { return }
+            DispatchQueue.main.async { self.connectionState = .scanningKnown }
+            currentScanMode = .knownDevices
+            centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            print("Scanning for known FlySight devices...")
+        }
+
+        public func startScanningForPairingModeDevices() {
+            guard centralManager.state == .poweredOn else { return }
+            DispatchQueue.main.async {
+                self.discoveredPairingPeripherals = [] // Clear previous results
+                self.connectionState = .scanningPairing
+            }
+            currentScanMode = .pairingMode
+            centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            print("Scanning for FlySight devices in pairing mode...")
+        }
+
+        public func stopScanning() {
+            centralManager.stopScan()
+            currentScanMode = .none
+            DispatchQueue.main.async {
+                // Only revert to idle if not in another active state like connecting/connected
+                if case .scanningKnown = self.connectionState { self.connectionState = .idle }
+                if case .scanningPairing = self.connectionState { self.connectionState = .idle }
+            }
+            print("Stopped scanning.")
+            disappearanceTimers.values.forEach { $0.invalidate() }
+            disappearanceTimers.removeAll()
+        }
+
+        // MARK: - Connection Logic
+        public func connect(to peripheralInfo: PeripheralInfo) {
+            guard centralManager.state == .poweredOn else {
+                print("Cannot connect: Bluetooth is not powered on.")
+                return
+            }
+
+            // If already trying to connect to the same peripheral, do nothing.
+            if case .connecting(let currentTarget) = connectionState, currentTarget.id == peripheralInfo.id {
+                print("Already attempting to connect to \(peripheralInfo.name).")
+                return
+            }
+
+            // If connected to a different peripheral, disconnect it first.
+            if let currentlyConnected = connectedPeripheralInfo, currentlyConnected.id != peripheralInfo.id {
+                print("Disconnecting from \(currentlyConnected.name) to connect to \(peripheralInfo.name).")
+                disconnect(from: currentlyConnected) // This will trigger state changes
+            }
+
+            print("Attempting to connect to \(peripheralInfo.name) (\(peripheralInfo.id))...")
+            DispatchQueue.main.async {
+                self.connectionState = .connecting(to: peripheralInfo)
+            }
+            self.peripheralBeingConnected = peripheralInfo.peripheral
+            centralManager.connect(peripheralInfo.peripheral, options: nil)
+        }
+
+        public func disconnect(from peripheralInfo: PeripheralInfo) {
+            guard let cbPeripheral = knownPeripherals.first(where: { $0.id == peripheralInfo.id })?.peripheral ??
+                                     discoveredPairingPeripherals.first(where: { $0.id == peripheralInfo.id})?.peripheral ??
+                                     (connectedPeripheralInfo?.id == peripheralInfo.id ? connectedPeripheralInfo?.peripheral : nil)
+            else {
+                print("Peripheral object not found for disconnection: \(peripheralInfo.name)")
+                return
+            }
+
+            print("Disconnecting from \(peripheralInfo.name)...")
+            DispatchQueue.main.async {
+                self.connectionState = .disconnecting(from: peripheralInfo)
+            }
+            centralManager.cancelPeripheralConnection(cbPeripheral)
+        }
+
+        private func attemptAutoConnect() {
+            guard centralManager.state == .poweredOn, connectedPeripheralInfo == nil,
+                  case .idle = connectionState else { // Only auto-connect if truly idle
+                return
+            }
+
+            if let lastID = lastConnectedPeripheralID {
+                print("Attempting to auto-connect to last peripheral: \(lastID)")
+                // Try to retrieve the peripheral directly
+                if let peripheral = centralManager.retrievePeripherals(withIdentifiers: [lastID]).first {
+                    let pInfo = PeripheralInfo(peripheral: peripheral, rssi: -100, name: peripheral.name ?? "FlySight", isConnected: false, isPairingMode: false, isBonded: self.bondedDeviceIDs.contains(peripheral.identifier))
+                    self.updateKnownPeripheralsList(with: pInfo) // Ensure it's in the list
+                    connect(to: pInfo)
+                } else {
+                    print("Could not retrieve last connected peripheral directly. Scanning for known devices.")
+                    startScanningForKnownDevices()
+                }
+            } else {
+                print("No last connected peripheral ID. Scanning for known devices.")
+                startScanningForKnownDevices()
+            }
+        }
+
+        // MARK: - Device Forgetting
+        public func forgetDevice(peripheralInfo: PeripheralInfo, completion: @escaping () -> Void) {
+            let deviceName = peripheralInfo.name
+
+            if connectedPeripheralInfo?.id == peripheralInfo.id {
+                disconnect(from: peripheralInfo)
+            }
+
+            removeBondedDeviceID(peripheralInfo.id)
+
+            DispatchQueue.main.async {
+                self.knownPeripherals.removeAll { $0.id == peripheralInfo.id }
+
+                let alert = UIAlertController(
+                    title: "Device Forgotten",
+                    message: "\(deviceName) has been removed from this app. For a complete unpair:\n1. Go to iPhone Settings > Bluetooth.\n2. Find \(deviceName), tap 'ⓘ', then 'Forget This Device'.\n3. On FlySight: Connect via USB, edit FLYSIGHT.TXT, set Reset_BLE=1, save, eject.",
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completion() })
+
+                self.presentAlert(alert)
+            }
+        }
+
+        private func presentAlert(_ alertController: UIAlertController) {
+            DispatchQueue.main.async { // Ensure UI operations are on the main thread
+                guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                      let rootViewController = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+                    print("Could not find root view controller to present alert.")
+                    // Call completion if alert cannot be shown, though this might not be ideal for all cases
+                    // For forgetDevice, it calls its own completion.
+                    return
+                }
+
+                var presentingController = rootViewController
+                while let presented = presentingController.presentedViewController {
+                    presentingController = presented
+                }
+                presentingController.present(alertController, animated: true)
+            }
+        }
+
+        // MARK: - CBCentralManagerDelegate
+        public func centralManagerDidUpdateState(_ central: CBCentralManager) {
+            DispatchQueue.main.async { // Ensure all state updates from here are main-threaded
+                switch central.state {
+                case .poweredOn:
+                    print("Bluetooth Powered On.")
+                    self.loadKnownPeripheralsFromUserDefaults() // Load bonded device IDs
+                    if self.connectionState == .idle { // Only auto-connect if truly idle
+                         self.attemptAutoConnect()
+                    } else if self.currentScanMode == .knownDevices { // Re-start scan if it was active
+                        self.startScanningForKnownDevices()
+                    } else if self.currentScanMode == .pairingMode {
+                        self.startScanningForPairingModeDevices()
                     }
-                    // If both have the same pairing mode status, sort by RSSI descending
+                case .poweredOff:
+                    print("Bluetooth Powered Off.")
+                    self.resetPeripheralState() // Clear all connection-related state
+                    self.knownPeripherals.indices.forEach { self.knownPeripherals[$0].isConnected = false }
+                    self.discoveredPairingPeripherals = []
+                    self.connectionState = .idle
+                    // Present an alert to the user
+                    let alert = UIAlertController(title: "Bluetooth Off", message: "Please turn on Bluetooth to use FlySight features.", preferredStyle: .alert)
+                    alert.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
+                    self.presentAlert(alert)
+                case .resetting:
+                    print("Bluetooth is resetting.")
+                    // Connection state will be updated once it's powered on or off
+                case .unauthorized:
+                    print("Bluetooth use unauthorized.")
+                    self.connectionState = .idle
+                    // Present an alert
+                     let alert = UIAlertController(title: "Bluetooth Unauthorized", message: "This app needs Bluetooth permission. Please enable it in Settings.", preferredStyle: .alert)
+                    alert.addAction(UIAlertAction(title: "Settings", style: .default) { _ in
+                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                    })
+                    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+                    self.presentAlert(alert)
+                case .unsupported:
+                    print("Bluetooth is unsupported on this device.")
+                    self.connectionState = .idle
+                    // Present an alert
+                    let alert = UIAlertController(title: "Bluetooth Unsupported", message: "This device does not support Bluetooth Low Energy.", preferredStyle: .alert)
+                    alert.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
+                    self.presentAlert(alert)
+                default:
+                    print("Bluetooth state unknown or new: \(central.state)")
+                }
+            }
+        }
+
+        public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+            guard let peripheralName = peripheral.name, peripheralName.contains("FlySight") else {
+                // Filter early if name doesn't suggest it's a FlySight, unless using manufacturer data only
+                // The FlySight documentation implies we should primarily use Manufacturer Data
+                if let manufData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data, manufData.count >= 2 {
+                    let manufID = UInt16(manufData[1]) << 8 | UInt16(manufData[0])
+                    if manufID != 0x09DB { return } // Not Bionic Avionics
+                } else {
+                    return // No name and no relevant manufacturer data
+                }
+            }
+
+            var isPairingModeAdvertised = false
+            if let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+               manufacturerData.count >= 3, // Length (0x04), Type (0xFF), ManufID_LSB, ManufID_MSB, StatusByte
+               (UInt16(manufacturerData[2]) | (UInt16(manufacturerData[1]) << 8)) == 0x09DB { // Check Manuf ID (0x09DB) - Note: Doc says DB0901, where DB09 is ID. My previous code was wrong.
+                // Corrected Manufacturer Data Parsing from Doc:
+                // Manuf. ID LSB: 0xDB (index 1 of manuf data if length byte is not counted, or index 2 if payload starts after length/type)
+                // Manuf. ID MSB: 0x09 (index 2 of manuf data or index 3)
+                // Status Byte (index 3 of manuf data or index 4)
+                // The CBAdvertisementDataManufacturerDataKey gives the "Manufacturer Specific Data" field *without* the main AD Length and Type.
+                // So, manufacturerData[0] = Manuf ID LSB, manufacturerData[1] = Manuf ID MSB
+                let manufID = UInt16(manufacturerData[0]) | (UInt16(manufacturerData[1]) << 8)
+                if manufID == 0x09DB && manufacturerData.count >= 3 { // ID + StatusByte
+                     isPairingModeAdvertised = (manufacturerData[2] & 0x01) != 0
+                } else { return } // Not our manufacturer
+            } else {
+                // If no manufacturer data, only proceed for known devices scan if already bonded
+                if currentScanMode != .knownDevices || !bondedDeviceIDs.contains(peripheral.identifier) {
+                    return
+                }
+            }
+
+            let discoveredInfo = PeripheralInfo(
+                peripheral: peripheral,
+                rssi: RSSI.intValue,
+                name: peripheral.name ?? "FlySight", // Use actual name if available
+                isConnected: false, // Will be updated on connect
+                isPairingMode: isPairingModeAdvertised,
+                isBonded: bondedDeviceIDs.contains(peripheral.identifier)
+            )
+
+            DispatchQueue.main.async {
+                switch self.currentScanMode {
+                case .knownDevices:
+                    // Update if already in knownPeripherals or add if it's a bonded device not yet listed (e.g. from retrievePeripherals fail)
+                    if discoveredInfo.isBonded {
+                        self.updateKnownPeripheralsList(with: discoveredInfo)
+                    }
+                case .pairingMode:
+                    if discoveredInfo.isPairingMode { // Only add if explicitly in pairing mode
+                        self.updateDiscoveredPairingPeripheralsList(with: discoveredInfo)
+                    }
+                case .none:
+                    break // Not actively scanning for general discovery
+                }
+            }
+        }
+
+        private func updateKnownPeripheralsList(with discoveredInfo: PeripheralInfo) {
+            if let index = knownPeripherals.firstIndex(where: { $0.id == discoveredInfo.id }) {
+                knownPeripherals[index].rssi = discoveredInfo.rssi
+                knownPeripherals[index].name = discoveredInfo.name
+                knownPeripherals[index].peripheral = discoveredInfo.peripheral // Update object
+                // isConnected and isBonded status are managed by connection/bonding events
+            } else if discoveredInfo.isBonded { // Add if bonded but somehow not in the list yet
+                knownPeripherals.append(discoveredInfo)
+            }
+            sortKnownPeripherals()
+        }
+
+        private func updateDiscoveredPairingPeripheralsList(with discoveredInfo: PeripheralInfo) {
+            if let index = discoveredPairingPeripherals.firstIndex(where: { $0.id == discoveredInfo.id }) {
+                discoveredPairingPeripherals[index].rssi = discoveredInfo.rssi
+                discoveredPairingPeripherals[index].name = discoveredInfo.name
+                discoveredPairingPeripherals[index].peripheral = discoveredInfo.peripheral
+                resetDisappearanceTimer(for: discoveredPairingPeripherals[index])
+            } else {
+                discoveredPairingPeripherals.append(discoveredInfo)
+                startDisappearanceTimer(for: discoveredInfo)
+            }
+            sortPairingPeripheralsByRSSI()
+        }
+
+        public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+            print("Connected to \(peripheral.name ?? peripheral.identifier.uuidString). Discovering services...")
+            peripheral.delegate = self
+
+            // Find the PeripheralInfo that corresponds to this CBPeripheral
+            // It could be from the known list or the pairing list (if connection was initiated from there)
+            // Or it's an auto-reconnection to a peripheral we retrieved by ID.
+            let connectingTargetInfo: PeripheralInfo?
+            if case .connecting(let target) = connectionState, target.id == peripheral.identifier {
+                connectingTargetInfo = target
+            } else { // Fallback if state wasn't perfectly set, e.g. auto-reconnect
+                connectingTargetInfo = knownPeripherals.first(where: {$0.id == peripheral.identifier}) ??
+                                       discoveredPairingPeripherals.first(where: {$0.id == peripheral.identifier})
+            }
+
+            let pInfo = connectingTargetInfo ?? PeripheralInfo(peripheral: peripheral, rssi: -100, name: peripheral.name ?? "FlySight", isConnected: true, isPairingMode: false, isBonded: bondedDeviceIDs.contains(peripheral.identifier))
+
+            DispatchQueue.main.async {
+                self.peripheralBeingConnected = peripheral // Store reference
+                self.connectionState = .discoveringServices(for: peripheral)
+
+                // Update the main connectedPeripheralInfo if this connection is for it
+                // This ensures that `connectedPeripheralInfo` is set early in the connection process
+                if self.connectedPeripheralInfo == nil || self.connectedPeripheralInfo?.id == peripheral.identifier {
+                    self.connectedPeripheralInfo = pInfo
+                }
+
+                // Update the specific list entry
+                if let index = self.knownPeripherals.firstIndex(where: { $0.id == peripheral.identifier }) {
+                    self.knownPeripherals[index].isConnected = true
+                    self.knownPeripherals[index].peripheral = peripheral // Ensure peripheral object is current
+                } else if pInfo.isBonded { // If bonded but not in list, add it
+                    var newKnown = pInfo
+                    newKnown.isConnected = true
+                    self.knownPeripherals.append(newKnown)
+                }
+                self.sortKnownPeripherals()
+            }
+
+            // Discover specific services critical for operation (File Transfer for pairing, Device Info)
+            // Add other services like SENSOR_DATA_SERVICE_UUID, STARTER_PISTOL_SERVICE_UUID, DEVICE_STATE_SERVICE_UUID
+            // if you want to discover them upfront.
+            let servicesToDiscover = [
+                FlySightCore.FILE_TRANSFER_SERVICE_UUID,
+                FlySightCore.DEVICE_INFORMATION_SERVICE_UUID,
+                FlySightCore.SENSOR_DATA_SERVICE_UUID,
+                FlySightCore.STARTER_PISTOL_SERVICE_UUID,
+                FlySightCore.DEVICE_STATE_SERVICE_UUID
+            ]
+            peripheral.discoverServices(servicesToDiscover)
+        }
+
+        public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+            let peripheralName = peripheral.name ?? peripheral.identifier.uuidString
+            print("Failed to connect to \(peripheralName): \(error?.localizedDescription ?? "Unknown error")")
+
+            DispatchQueue.main.async {
+                if self.peripheralBeingConnected?.identifier == peripheral.identifier {
+                    self.peripheralBeingConnected = nil
+                }
+                // Revert connectionState to idle or scanningKnown depending on context
+                if case .connecting(let targetInfo) = self.connectionState, targetInfo.id == peripheral.identifier {
+                     self.connectionState = .idle // Or perhaps .scanningKnown if appropriate
+                }
+
+                if self.connectedPeripheralInfo?.id == peripheral.identifier {
+                    self.connectedPeripheralInfo = nil
+                }
+                if let index = self.knownPeripherals.firstIndex(where: { $0.id == peripheral.identifier }) {
+                    self.knownPeripherals[index].isConnected = false
+                }
+                self.sortKnownPeripherals()
+
+                // If auto-connect failed for the last known device, go back to scanning for known devices.
+                if self.lastConnectedPeripheralID == peripheral.identifier {
+                    self.startScanningForKnownDevices()
+                }
+            }
+        }
+
+        public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+            let peripheralName = peripheral.name ?? peripheral.identifier.uuidString
+            print("Disconnected from \(peripheralName). Reason: \(error?.localizedDescription ?? "None")")
+
+            DispatchQueue.main.async {
+                let previouslyConnectedInfo = self.connectedPeripheralInfo // Capture before resetting
+                self.resetPeripheralState() // Clears current peripheral, chars, timers etc.
+
+                if let pInfo = previouslyConnectedInfo {
+                    // Update the specific list entry
+                    if let index = self.knownPeripherals.firstIndex(where: { $0.id == pInfo.id }) {
+                        self.knownPeripherals[index].isConnected = false
+                    }
+                }
+                self.connectionState = .idle
+                self.sortKnownPeripherals()
+
+                // If the disconnection was unexpected (error != nil), try to auto-connect or scan again.
+                if error != nil {
+                    print("Unexpected disconnection, attempting to restore or scan.")
+                    self.attemptAutoConnect() // This will scan if no last ID or retrieval fails
+                }
+            }
+        }
+
+        // MARK: - CBPeripheralDelegate
+        public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+            guard error == nil else {
+                print("Error discovering services on \(peripheral.identifier): \(error!.localizedDescription)")
+                if peripheral.identifier == peripheralBeingConnected?.identifier || peripheral.identifier == connectedPeripheralInfo?.id {
+                    disconnect(from: PeripheralInfo(peripheral: peripheral, rssi: 0, name: "", isBonded: false)) // Simplify disconnect call
+                }
+                return
+            }
+
+            guard let services = peripheral.services, !services.isEmpty else {
+                print("No services found for \(peripheral.identifier). This is unexpected.")
+                // Consider disconnecting if essential services are missing.
+                return
+            }
+
+            DispatchQueue.main.async {
+                if case .discoveringServices(let p) = self.connectionState, p.identifier == peripheral.identifier {
+                    self.connectionState = .discoveringCharacteristics(for: peripheral)
+                }
+            }
+
+            for service in services {
+                print("Discovered service: \(service.uuid.uuidString) on \(peripheral.identifier)")
+                peripheral.discoverCharacteristics(nil, for: service) // Discover all characteristics for found services
+            }
+        }
+
+        public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+            guard error == nil else {
+                print("Error discovering characteristics for service \(service.uuid) on \(peripheral.identifier): \(error!.localizedDescription)")
+                // Potentially disconnect if critical characteristics are missing for a critical service
+                return
+            }
+            guard let characteristics = service.characteristics else { return }
+
+            for characteristic in characteristics {
+                print("Discovered characteristic: \(characteristic.uuid.uuidString) in service: \(service.uuid.uuidString)")
+                switch characteristic.uuid {
+                // File Transfer
+                case FlySightCore.FT_PACKET_IN_UUID:
+                    ftPacketInCharacteristic = characteristic
+                    // **PAIRING TRIGGER POINT**
+                    // If not bonded, reading this secure characteristic prompts iOS to pair.
+                    if !bondedDeviceIDs.contains(peripheral.identifier) {
+                        print("Device \(peripheral.identifier) not bonded. Reading FT_Packet_In to trigger pairing...")
+                        peripheral.readValue(for: characteristic)
+                    } else {
+                        // If already bonded, we might still read it to confirm characteristic is responsive,
+                        // or just proceed knowing it's there. For now, assume successful discovery is enough if bonded.
+                        print("FT_Packet_In found, device already bonded.")
+                    }
+                case FlySightCore.FT_PACKET_OUT_UUID:
+                    ftPacketOutCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic)
+                // Sensor Data
+                case FlySightCore.SD_GNSS_MEASUREMENT_UUID:
+                    sdGNSSMeasurementCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic)
+                case FlySightCore.SD_CONTROL_POINT_UUID:
+                    sdControlPointCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Indications
+                // Starter Pistol
+                case FlySightCore.SP_CONTROL_POINT_UUID:
+                    spControlPointCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Indications
+                case FlySightCore.SP_RESULT_UUID:
+                    spResultCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Indications
+                // Device State
+                case FlySightCore.DS_MODE_UUID:
+                    dsModeCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Indications
+                case FlySightCore.DS_CONTROL_POINT_UUID:
+                    dsControlPointCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Indications
+                // Device Information
+                case FlySightCore.FIRMWARE_REVISION_STRING_UUID:
+                    firmwareRevisionCharacteristic = characteristic
+                    peripheral.readValue(for: characteristic) // Read firmware version
+                default:
+                    break
+                }
+            }
+
+            // Check if all *essential* characteristics are found to consider the device fully set up.
+            // For FlySight, FT_Packet_In and FT_Packet_Out are essential for basic operation and pairing confirmation.
+            if ftPacketInCharacteristic != nil && ftPacketOutCharacteristic != nil {
+                // If already bonded, we can proceed to full operational state.
+                // If not bonded, pairing is triggered by the read of FT_Packet_In.
+                // The transition to fully connected state will happen after successful read & bonding confirmation.
+                if bondedDeviceIDs.contains(peripheral.identifier) {
+                    // If we're already bonded and just reconnected, and essential chars are found:
+                    if case .discoveringCharacteristics = connectionState {
+                         handlePostBondingSetup(for: peripheral)
+                    }
+                }
+            }
+        }
+
+        private func handlePostBondingSetup(for peripheral: CBPeripheral) {
+            guard let currentTargetInfo = connectedPeripheralInfo, currentTargetInfo.id == peripheral.identifier else {
+                 print("handlePostBondingSetup called for a peripheral that is not the current target.")
+                 // This might happen if a connection was quickly cancelled and another started.
+                 // Or if peripheral is not correctly set in connectedPeripheralInfo.
+                 // We should ensure connectedPeripheralInfo is the source of truth for "who are we setting up".
+                 if let knownInfo = knownPeripherals.first(where: {$0.id == peripheral.identifier}) {
+                     DispatchQueue.main.async { self.connectedPeripheralInfo = knownInfo }
+                 } else {
+                     // This is less ideal, means we don't have full app-level info for it.
+                     DispatchQueue.main.async { self.connectedPeripheralInfo = PeripheralInfo(peripheral: peripheral, rssi: -100, name: peripheral.name ?? "FlySight", isConnected: true, isBonded: true)}
+                 }
+                 // Re-check after attempting to set connectedPeripheralInfo
+                 guard self.connectedPeripheralInfo?.id == peripheral.identifier else {
+                     print("Failed to align connectedPeripheralInfo for post bonding setup.")
+                     return
+                 }
+                 print("Aligned connectedPeripheralInfo for post bonding setup.")
+            }
+
+            print("Device \(peripheral.identifier) is bonded and essential characteristics found. Finalizing setup.")
+            addBondedDeviceID(peripheral.identifier) // Ensure it's marked as bonded
+            self.lastConnectedPeripheralID = peripheral.identifier // Mark as last successfully connected
+
+            DispatchQueue.main.async {
+                // Update the PeripheralInfo object to reflect bonded status and ensure it's in knownPeripherals.
+                var finalInfo = self.connectedPeripheralInfo! // Should be set by now
+                finalInfo.isBonded = true
+                finalInfo.isConnected = true
+                finalInfo.isPairingMode = false // Should be false after successful pairing
+
+                self.connectedPeripheralInfo = finalInfo // Update the published property
+
+                if let index = self.knownPeripherals.firstIndex(where: { $0.id == peripheral.identifier }) {
+                    self.knownPeripherals[index] = finalInfo
+                } else {
+                    self.knownPeripherals.append(finalInfo)
+                }
+                // Remove from pairing list if it was there
+                self.discoveredPairingPeripherals.removeAll { $0.id == peripheral.identifier }
+
+                self.sortKnownPeripherals()
+                self.connectionState = .connected(to: finalInfo)
+
+                // Start operational tasks
+                self.loadDirectoryEntries()
+                self.startPingTimer()
+                self.fetchGNSSMask()
+                if self.firmwareRevisionCharacteristic == nil,
+                   let dis = peripheral.services?.first(where: {$0.uuid == FlySightCore.DEVICE_INFORMATION_SERVICE_UUID}),
+                   let fwChar = dis.characteristics?.first(where: {$0.uuid == FlySightCore.FIRMWARE_REVISION_STRING_UUID}) {
+                    self.firmwareRevisionCharacteristic = fwChar
+                    peripheral.readValue(for: fwChar)
+                }
+            }
+        }
+
+        public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+            // Handle the read of FT_Packet_In (Pairing Trigger)
+            if characteristic.uuid == FlySightCore.FT_PACKET_IN_UUID {
+                if error == nil {
+                    print("Successfully read FT_Packet_In.")
+                    // This read is primarily to trigger pairing. If successful and device is now bonded, proceed.
+                    if bondedDeviceIDs.contains(peripheral.identifier) {
+                         // Check if we are in the process of connecting and discovering
+                        if case .discoveringCharacteristics(let p) = connectionState, p.identifier == peripheral.identifier {
+                             handlePostBondingSetup(for: peripheral)
+                        } else if case .connecting(let target) = connectionState, target.id == peripheral.identifier {
+                            // This can happen if characteristic discovery was very fast and state hasn't updated yet.
+                            // Or if we re-read it for some reason.
+                            handlePostBondingSetup(for: peripheral)
+                        }
+                    } else {
+                        // This scenario is less likely if pairing was successful, OS should have bonded.
+                        // If not bonded, it implies pairing might have failed or was cancelled by user.
+                        // The system might disconnect or the next operation on a protected char will fail.
+                        print("Read FT_Packet_In but device \(peripheral.identifier) is NOT in bondedDeviceIDs. Pairing may have failed system-side.")
+                        // Consider disconnecting or re-initiating pairing if appropriate, but often iOS handles this by disconnecting.
+                    }
+                } else {
+                    print("Error reading FT_Packet_In (pairing trigger): \(error!.localizedDescription)")
+                    if error!.asBLEError?.isInsufficientAuthentication == true || error!.asBLEError?.isInsufficientEncryption == true {
+                        // This is expected if pairing is required and OS is showing prompt.
+                        // No action needed here; OS handles the pairing. Successful connection/bonding will follow if user accepts.
+                        print("Pairing process likely initiated by OS due to insufficient authentication/encryption on FT_Packet_In read.")
+                    } else {
+                        // Other error, pairing might have failed.
+                        // Consider disconnecting.
+                         disconnect(from: PeripheralInfo(peripheral: peripheral, rssi: 0, name: "", isBonded: false))
+                    }
+                    return // Don't process further for this characteristic if there was an error on the pairing trigger
+                }
+            }
+
+            // Firmware Revision String
+            if characteristic.uuid == FlySightCore.FIRMWARE_REVISION_STRING_UUID, error == nil, let data = characteristic.value {
+                if let fwVersion = String(data: data, encoding: .utf8) {
+                    DispatchQueue.main.async {
+                        self.flysightFirmwareVersion = fwVersion
+                        print("FlySight Firmware Version: \(fwVersion)")
+                    }
+                }
+            }
+
+            // Generic error handling for other characteristics
+            guard error == nil else {
+                print("Error updating value for \(characteristic.uuid): \(error!.localizedDescription)")
+                DispatchQueue.main.async {
+                    if characteristic.uuid == FlySightCore.SD_CONTROL_POINT_UUID { // Example specific error handling
+                        self.gnssMaskUpdateStatus = .failure(" Characteristic update error: \(error!.localizedDescription)")
+                    }
+                    if characteristic.uuid == FlySightCore.FT_PACKET_OUT_UUID { //CRS_TX_UUID
+                        self.isAwaitingDirectoryResponse = false
+                    }
+                }
+                // Pass error to specific handlers if they exist
+                if let handler = notificationHandlers[characteristic.uuid] {
+                    handler(peripheral, characteristic, error)
+                }
+                return
+            }
+
+            guard let data = characteristic.value else {
+                print("No data in characteristic update for \(characteristic.uuid)")
+                return
+            }
+
+            // Route data to specific handlers or parse directly
+            var handledBySpecificLogic = false
+            if characteristic.uuid == FlySightCore.FT_PACKET_OUT_UUID { // CRS_TX_UUID: Directory listings, ACKs, NAKs, download data
+                // This characteristic can send various packet types.
+                // Opcode is data[0].
+                let opcode = data[0]
+                switch opcode {
+                case 0x11: // File Info (Directory Entry)
+                    DispatchQueue.main.async {
+                        if let entry = self.parseDirectoryEntry(from: data) { // expects full data with opcode
+                            if entry.isEmptyMarker { // Check for our special end-of-list marker
+                                print("End of directory listing received (marker).")
+                                self.isAwaitingDirectoryResponse = false
+                            } else {
+                                self.directoryEntries.append(entry)
+                                self.sortDirectoryEntries()
+                                // isAwaitingDirectoryResponse remains true
+                            }
+                        } else {
+                            // This means parseDirectoryEntry returned nil for a 0x11 packet that wasn't an end marker.
+                            // Potentially log this as an unexpected format.
+                            print("Parsed directory entry was nil for opcode 0x11, but not an end marker.")
+                        }
+                    }
+                    handledBySpecificLogic = true
+                case 0xF0: // NAK
+                    let originalCommand = data.count > 1 ? data[1] : 0xFF
+                    print("Received NAK for command 0x\(String(format: "%02X", originalCommand))")
+                    DispatchQueue.main.async { self.isAwaitingDirectoryResponse = false }
+                     if originalCommand == 0x03 { // Write File (Open) NAK
+                        self.uploadContinuation?.resume(throwing: NSError(domain: "FlySightCore.Upload", code: Int(originalCommand), userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file for writing (NAK)."]))
+                        self.uploadContinuation = nil
+                        self.isUploading = false
+                    }
+                    handledBySpecificLogic = true
+                case 0xF1: // ACK
+                    let originalCommand = data.count > 1 ? data[1] : 0xFF
+                    print("Received ACK for command 0x\(String(format: "%02X", originalCommand))")
+                    if originalCommand == 0x05 { // List Directory command ACK
+                        DispatchQueue.main.async { self.isAwaitingDirectoryResponse = true } // Now waiting for 0x11 packets
+                    } else if originalCommand == 0x03 { // Write File (Open) ACK
+                        // The uploadFile Task will handle sending data chunks now.
+                        // This ACK primarily confirms the file is open on the device.
+                    } else if originalCommand == 0x02 { // Read File ACK
+                        // Download process expects 0x10 data chunks now.
+                    }
+                    handledBySpecificLogic = true
+                // 0x10 (File Data for download) and 0x12 (ACK for upload data) are handled by registered notificationHandlers
+                default:
+                    break // Other opcodes might be handled by specific handlers below
+                }
+            } else if characteristic.uuid == FlySightCore.SP_RESULT_UUID {
+                processStartResult(data: data)
+                handledBySpecificLogic = true
+            } else if characteristic.uuid == FlySightCore.SD_GNSS_MEASUREMENT_UUID {
+                parseLiveGNSSData(from: data)
+                handledBySpecificLogic = true
+            } else if characteristic.uuid == FlySightCore.SD_CONTROL_POINT_UUID {
+                processSDControlPointResponse(from: data)
+                handledBySpecificLogic = true
+            } else if characteristic.uuid == FlySightCore.SP_CONTROL_POINT_UUID {
+                processSPControlPointResponse(from: data)
+                handledBySpecificLogic = true
+            } else if characteristic.uuid == FlySightCore.DS_MODE_UUID {
+                // Potentially parse and update device mode
+                // let modeValue = data[0]
+                // print("DS_Mode updated: \(modeValue)")
+                handledBySpecificLogic = true
+            }
+
+
+            // Check for registered notification handlers (e.g., for file download/upload on FT_PACKET_OUT_UUID)
+            if let handler = notificationHandlers[characteristic.uuid] {
+                handler(peripheral, characteristic, error) // error will be nil here
+            } else if !handledBySpecificLogic {
+                // print("No specific logic or registered handler for characteristic \(characteristic.uuid). Data: \(data.hexEncodedString())")
+            }
+        }
+
+        public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+            if let error = error {
+                print("Write error for characteristic \(characteristic.uuid): \(error.localizedDescription)")
+                if characteristic.uuid == FlySightCore.FT_PACKET_IN_UUID && isUploading {
+                    // This is tricky because FT_PACKET_IN uses WriteWithoutResponse for data chunks.
+                    // An error here for FT_PACKET_IN would be unexpected unless it was for a Write *With* Response.
+                    // The GBN ARQ handles reliability for WriteWithoutResponse.
+                    // If it's for the initial "Open File" command (if it used WriteWithResponse, which it doesn't as per doc),
+                    // then it would be a failure. For now, GBN handles data chunk issues.
+                }
+                if characteristic.uuid == FlySightCore.SD_CONTROL_POINT_UUID {
+                    DispatchQueue.main.async {
+                        if self.gnssMaskUpdateStatus == .pending {
+                            self.gnssMaskUpdateStatus = .failure("Write failed for SD Control Point: \(error.localizedDescription)")
+                        }
+                        self.lastAttemptedGNSSMask = nil
+                        if self.connectedPeripheralInfo != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
+                    }
+                }
+                return
+            }
+            // print("Write successful for characteristic \(characteristic.uuid)")
+            // For WriteWithoutResponse, this callback isn't typically invoked unless there's an issue queuing the write.
+            // For WriteWithResponse, this confirms the peripheral received it.
+        }
+
+        public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+            if let error = error {
+                print("Error changing notification state for \(characteristic.uuid): \(error.localizedDescription)")
+                // If enabling notifications for a critical characteristic fails, consider it a connection setup issue.
+                if characteristic.uuid == FlySightCore.FT_PACKET_OUT_UUID && characteristic.isNotifying {
+                    // disconnect or try again?
+                }
+                return
+            }
+            print("Notification state for \(characteristic.uuid) is now \(characteristic.isNotifying ? "ON" : "OFF")")
+        }
+
+        public func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+            if error == nil {
+                DispatchQueue.main.async {
+                    if let index = self.knownPeripherals.firstIndex(where: { $0.id == peripheral.identifier }) {
+                        self.knownPeripherals[index].rssi = RSSI.intValue
+                        self.sortKnownPeripherals()
+                    } else if let index = self.discoveredPairingPeripherals.firstIndex(where: { $0.id == peripheral.identifier }) {
+                        self.discoveredPairingPeripherals[index].rssi = RSSI.intValue
+                        self.sortPairingPeripheralsByRSSI()
+                    }
+                }
+            }
+        }
+
+        // MARK: - Bonded Device ID Management
+        var bondedDeviceIDsKey: String { "bondedDeviceIDs_v3" } // Use a new key if format changes significantly
+
+        var bondedDeviceIDs: Set<UUID> {
+            get {
+                guard let data = UserDefaults.standard.data(forKey: bondedDeviceIDsKey) else { return [] }
+                do {
+                    return try JSONDecoder().decode(Set<UUID>.self, from: data)
+                } catch {
+                    print("Failed to decode bondedDeviceIDs: \(error)")
+                    UserDefaults.standard.removeObject(forKey: bondedDeviceIDsKey) // Clear corrupted data
+                    return []
+                }
+            }
+            set {
+                do {
+                    let data = try JSONEncoder().encode(newValue)
+                    UserDefaults.standard.set(data, forKey: bondedDeviceIDsKey)
+                } catch {
+                    print("Failed to encode bondedDeviceIDs: \(error)")
+                }
+            }
+        }
+
+        private func addBondedDeviceID(_ peripheralID: UUID) {
+            var currentBonded = bondedDeviceIDs
+            if !currentBonded.contains(peripheralID) {
+                currentBonded.insert(peripheralID)
+                bondedDeviceIDs = currentBonded
+                print("Added \(peripheralID) to app's bonded list.")
+            }
+        }
+
+        private func removeBondedDeviceID(_ peripheralID: UUID) {
+            var currentBonded = bondedDeviceIDs
+            if currentBonded.contains(peripheralID) {
+                currentBonded.remove(peripheralID)
+                bondedDeviceIDs = currentBonded
+                print("Removed \(peripheralID) from app's bonded list.")
+            }
+        }
+
+        private func loadKnownPeripheralsFromUserDefaults() {
+            let bondedIDs = self.bondedDeviceIDs
+            var currentKnown = self.knownPeripherals
+            var updatedKnownPeripherals: [PeripheralInfo] = []
+            var madeChanges = false
+
+            // Create PeripheralInfo for each bonded ID if not already in list
+            for id in bondedIDs {
+                if let existingInfo = currentKnown.first(where: { $0.id == id }) {
+                    var infoToKeep = existingInfo
+                    infoToKeep.isBonded = true // Ensure bonded status is correct
+                    updatedKnownPeripherals.append(infoToKeep)
+                } else {
+                    // Attempt to retrieve the peripheral if it's known to the system
+                    if let peripheral = centralManager.retrievePeripherals(withIdentifiers: [id]).first {
+                        updatedKnownPeripherals.append(PeripheralInfo(peripheral: peripheral, rssi: -100, name: peripheral.name ?? "FlySight", isConnected: false, isPairingMode: false, isBonded: true))
+                        madeChanges = true
+                    } else {
+                        // Cannot retrieve peripheral object, but it's in our bonded list.
+                        // This can happen if the peripheral is not nearby or system has lost track.
+                        // We can't create a PeripheralInfo without a CBPeripheral.
+                        // It will be added if discovered during a scan.
+                        print("Bonded device ID \(id) found in UserDefaults, but CBPeripheral not retrieved. Will appear if scanned.")
+                    }
+                }
+            }
+
+            // Remove any from currentKnown that are no longer in bondedDeviceIDs (e.g. user unpaired from settings)
+            // This step is tricky because we don't get a direct notification for system-level unpairing.
+            // For now, this list is additive from UserDefaults and updated on discovery.
+            // A full sync would involve checking `retrievePeripherals` for all, which can be slow.
+            // `forgetDevice` in app is the primary way to remove from `bondedDeviceIDs`.
+
+            if madeChanges || updatedKnownPeripherals.count != currentKnown.count {
+                DispatchQueue.main.async {
+                    self.knownPeripherals = updatedKnownPeripherals
+                    self.sortKnownPeripherals()
+                }
+            }
+        }
+
+
+        // MARK: - Sorting
+        public func sortKnownPeripherals() {
+            DispatchQueue.main.async {
+                self.knownPeripherals.sort {
+                    if $0.isConnected != $1.isConnected { return $0.isConnected && !$1.isConnected }
                     return $0.rssi > $1.rssi
                 }
             }
         }
 
-        public func connect(to peripheral: CBPeripheral) {
-            centralManager?.connect(peripheral, options: nil)
-            if let index = peripheralInfos.firstIndex(where: { $0.peripheral.identifier == peripheral.identifier }) {
-                peripheralInfos[index].isConnected = true
-                timers[peripheral.identifier]?.invalidate() // Stop the timer when connected
-                addBondedDevice(peripheral)  // Mark as bonded
+        public func sortPairingPeripheralsByRSSI() {
+            DispatchQueue.main.async {
+                self.discoveredPairingPeripherals.sort { $0.rssi > $1.rssi }
             }
         }
 
-        public func disconnect(from peripheral: CBPeripheral) {
-            centralManager?.cancelPeripheralConnection(peripheral)
-            if let index = peripheralInfos.firstIndex(where: { $0.peripheral.identifier == peripheral.identifier }) {
-                // Check if the peripheral is bonded
-                if !bondedDeviceIDs.contains(peripheral.identifier) {
-                    // Remove the peripheral if it's not bonded
-                    peripheralInfos.remove(at: index)
-                    timers[peripheral.identifier]?.invalidate()
-                    timers.removeValue(forKey: peripheral.identifier)
-                } else {
-                    // Update the connection status without removing from the list
-                    peripheralInfos[index].isConnected = false
-                    // Optionally restart the timer if you want to eventually remove it if it does not advertise again
-                    startDisappearanceTimer(for: peripheralInfos[index])
+        public func sortDirectoryEntries() {
+            DispatchQueue.main.async {
+                self.directoryEntries.sort {
+                    if $0.isFolder != $1.isFolder { return $0.isFolder && !$1.isFolder }
+                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
                 }
             }
         }
 
-        private func parseDirectoryEntry(from data: Data) -> DirectoryEntry? {
-            guard data.count == 24 else { return nil } // Ensure data length is as expected
-
-            let size: UInt32 = data.subdata(in: 2..<6).withUnsafeBytes { $0.load(as: UInt32.self) }
-            let fdate: UInt16 = data.subdata(in: 6..<8).withUnsafeBytes { $0.load(as: UInt16.self) }
-            let ftime: UInt16 = data.subdata(in: 8..<10).withUnsafeBytes { $0.load(as: UInt16.self) }
-            let fattrib: UInt8 = data.subdata(in: 10..<11).withUnsafeBytes { $0.load(as: UInt8.self) }
-
-            let nameData = data.subdata(in: 11..<24) // Assuming the rest is the name
-            let nameDataNullTerminated = nameData.split(separator: 0, maxSplits: 1, omittingEmptySubsequences: false).first ?? Data() // Split at the first null byte
-            guard let name = String(data: nameDataNullTerminated, encoding: .utf8), !name.isEmpty else { return nil } // Check for empty name
-
-            // Decode date and time
-            let year = Int((fdate >> 9) & 0x7F) + 1980
-            let month = Int((fdate >> 5) & 0x0F)
-            let day = Int(fdate & 0x1F)
-            let hour = Int((ftime >> 11) & 0x1F)
-            let minute = Int((ftime >> 5) & 0x3F)
-            let second = Int((ftime & 0x1F) * 2) // Multiply by 2 to get the actual seconds
-
-            var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-            guard let date = calendar.date(from: DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second)) else { return nil }
-
-            // Decode attributes
-            let attributesOrder = ["r", "h", "s", "a", "d"]
-            let attribText = attributesOrder.enumerated().map { index, letter in
-                (fattrib & (1 << index)) != 0 ? letter : "-"
-            }.joined()
-
-            return DirectoryEntry(size: size, date: date, attributes: attribText, name: name)
-        }
-
-        public func changeDirectory(to newDirectory: String) {
-            guard !isAwaitingResponse else { return }
-
-            // Append new directory to the path
-            currentPath.append(newDirectory)
-            loadDirectoryEntries()
-        }
-
-        public func goUpOneDirectoryLevel() {
-            guard !isAwaitingResponse else { return }
-
-            // Remove the last directory in the path
-            if currentPath.count > 0 {
-                currentPath.removeLast()
-                loadDirectoryEntries()
-            }
-        }
-
-        public func loadDirectoryEntries() {
-            // Reset the directory listings
-            directoryEntries = []
-
-            // Set waiting flag
-            isAwaitingResponse = true
-
-            if let peripheral = connectedPeripheral?.peripheral, let rx = rxCharacteristic {
-                let directory = "/" + (currentPath).joined(separator: "/")
-                print("  Getting directory \(directory)")
-                let directoryCommand = Data([0x05]) + directory.data(using: .utf8)!
-                peripheral.writeValue(directoryCommand, for: rx, type: .withoutResponse)
-            }
-        }
-
-        // Helper functions
+        // MARK: - Timers
         private func startDisappearanceTimer(for peripheralInfo: PeripheralInfo) {
-            if !bondedDeviceIDs.contains(peripheralInfo.id) {
-                timers[peripheralInfo.id]?.invalidate()
-                timers[peripheralInfo.id] = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-                    if !peripheralInfo.isConnected {
-                        self?.removePeripheral(peripheralInfo)
-                    }
-                }
+            guard peripheralInfo.isPairingMode && !bondedDeviceIDs.contains(peripheralInfo.id) else { return }
+            disappearanceTimers[peripheralInfo.id]?.invalidate()
+            disappearanceTimers[peripheralInfo.id] = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in // Increased timeout
+                self?.removeDisappearedPairingPeripheral(id: peripheralInfo.id)
             }
         }
 
-        private func resetTimer(for peripheralInfo: PeripheralInfo) {
-            if !bondedDeviceIDs.contains(peripheralInfo.id) {
-                startDisappearanceTimer(for: peripheralInfo)
-            }
+        private func resetDisappearanceTimer(for peripheralInfo: PeripheralInfo) {
+            startDisappearanceTimer(for: peripheralInfo)
         }
 
-        private func removePeripheral(_ peripheralInfo: PeripheralInfo) {
+        private func removeDisappearedPairingPeripheral(id: UUID) {
             DispatchQueue.main.async {
-                self.peripheralInfos.removeAll { $0.id == peripheralInfo.id }
-                self.timers[peripheralInfo.id]?.invalidate()
-                self.timers.removeValue(forKey: peripheralInfo.id)
-            }
-        }
-
-        public func sendStartCommand() {
-            guard let spControlChar = spControlPointCharacteristic else {
-                print("SP Control Point characteristic not found")
-                // Potentially provide feedback to the UI that the command cannot be sent
-                return
-            }
-
-            // Sending 0x01 (SP_CMD_START_COUNTDOWN)
-            let startCommand = Data([FlySightCore.SPControlOpcodes.startCountdown])
-            connectedPeripheral?.peripheral.writeValue(startCommand, for: spControlChar, type: .withResponse) // .withResponse is okay; the app-level ack is the Indication
-            print("Sent Start command to SP Control Point.")
-            // State change to .counting will occur in processSPControlPointResponse upon successful indication.
-        }
-
-        public func sendCancelCommand() {
-            guard let spControlChar = spControlPointCharacteristic else {
-                print("SP Control Point characteristic not found")
-                // Potentially provide feedback to the UI
-                return
-            }
-
-            // Sending 0x02 (SP_CMD_CANCEL_COUNTDOWN)
-            let cancelCommand = Data([FlySightCore.SPControlOpcodes.cancelCountdown])
-            connectedPeripheral?.peripheral.writeValue(cancelCommand, for: spControlChar, type: .withResponse)
-            print("Sent Cancel command to SP Control Point.")
-            // State change to .idle will occur in processSPControlPointResponse upon successful indication.
-        }
-
-        public func processStartResult(data: Data) {
-            guard data.count == 9 else {
-                print("Invalid start result data length")
-                return
-            }
-
-            let year = data.subdata(in: 0..<2).withUnsafeBytes { $0.load(as: UInt16.self) }
-            let month = data.subdata(in: 2..<3).withUnsafeBytes { $0.load(as: UInt8.self) }
-            let day = data.subdata(in: 3..<4).withUnsafeBytes { $0.load(as: UInt8.self) }
-            let hour = data.subdata(in: 4..<5).withUnsafeBytes { $0.load(as: UInt8.self) }
-            let minute = data.subdata(in: 5..<6).withUnsafeBytes { $0.load(as: UInt8.self) }
-            let second = data.subdata(in: 6..<7).withUnsafeBytes { $0.load(as: UInt8.self) }
-            let timestampMs = data.subdata(in: 7..<9).withUnsafeBytes { $0.load(as: UInt16.self) }
-
-            var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? TimeZone(abbreviation: "UTC")!
-
-            var components = DateComponents()
-            components.year = Int(year)
-            components.month = Int(month)
-            components.day = Int(day)
-            components.hour = Int(hour)
-            components.minute = Int(minute)
-            components.second = Int(second)
-            components.nanosecond = Int(timestampMs) * 1_000_000
-
-            guard let date = calendar.date(from: components) else {
-                print("Failed to create date from start result data")
-                return
-            }
-
-            DispatchQueue.main.async {
-                if self.state == .counting {
-                    self.startResultDate = date
-                    self.state = .idle
+                if let index = self.discoveredPairingPeripherals.firstIndex(where: { $0.id == id && !$0.isConnected }) {
+                    let removed = self.discoveredPairingPeripherals.remove(at: index)
+                    print("Pairing mode device \(removed.name) disappeared.")
+                    self.disappearanceTimers.removeValue(forKey: id)
+                    // sortPairingPeripheralsByRSSI() // List will re-sort if needed on next discovery
                 }
             }
-        }
-
-        public func downloadFile(named filePath: String, completion: @escaping (Result<Data, Error>) -> Void) {
-            guard let peripheral = connectedPeripheral?.peripheral, let rx = rxCharacteristic, let tx = txCharacteristic else {
-                completion(.failure(NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "No connected peripheral or RX characteristic"])))
-                return
-            }
-
-            var fileData = Data()
-            var nextPacketNum: UInt8 = 0
-            let transferComplete = PassthroughSubject<Void, Error>()
-
-            // Extract the file name from the full path
-            let fileName = (filePath as NSString).lastPathComponent
-
-            // Set the current file size (assuming you know it here)
-            if let fileEntry = directoryEntries.first(where: { $0.name == fileName }) {
-                currentFileSize = fileEntry.size
-            } else {
-                currentFileSize = 0  // Fallback to 0 if file size is unknown
-            }
-
-            // Define the notification handler
-            let notifyHandler: (CBPeripheral, CBCharacteristic, Error?) -> Void = { [weak self] (peripheral, characteristic, error) in
-                guard error == nil, let data = characteristic.value else {
-                    transferComplete.send(completion: .failure(error ?? NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unknown error"])))
-                    return
-                }
-                if data[0] == 0x10 {
-                    let packetNum = data[1]
-                    if packetNum == nextPacketNum {
-                        if data.count > 2 {
-                            fileData.append(data[2...])
-                        } else {
-                            transferComplete.send(completion: .finished)
-                        }
-                        nextPacketNum = nextPacketNum &+ 1
-                        let ackPacket = Data([0x12, packetNum])
-                        peripheral.writeValue(ackPacket, for: rx, type: .withoutResponse)
-
-                        print("Received packet: \(packetNum), length \(data.count - 2)")
-
-                        // Update the download progress
-                        if let fileSize = self?.currentFileSize {
-                            let progress = Float(fileData.count) / Float(fileSize)
-                            DispatchQueue.main.async {
-                                self?.downloadProgress = progress
-                            }
-                        }
-                    } else {
-                        print("Out of order packet: \(packetNum)")
-                    }
-                }
-            }
-
-            // Save the handler in a dictionary to be used in didUpdateValueFor
-            notificationHandlers[tx.uuid] = notifyHandler
-
-            print("  Getting file \(filePath)")
-
-            // Create offset and stride bytes as per the Python script
-            let offset: UInt32 = 0
-            let stride: UInt32 = 0
-            let offsetBytes = withUnsafeBytes(of: offset.littleEndian, Array.init)
-            let strideBytes = withUnsafeBytes(of: stride.littleEndian, Array.init)
-            let command = Data([0x02]) + offsetBytes + strideBytes + filePath.data(using: .utf8)!
-
-            // Write the command to start the file transfer
-            peripheral.writeValue(command, for: rx, type: .withoutResponse)
-
-            // Subscribe to the completion of the transfer
-            let cancellable = transferComplete.sink(receiveCompletion: { result in
-                self.notificationHandlers[tx.uuid] = nil // Clear the handler after use
-                switch result {
-                case .failure(let error):
-                    completion(.failure(error))
-                case .finished:
-                    completion(.success(fileData))
-                }
-            }, receiveValue: { _ in })
-
-            cancellable.store(in: &cancellables)
-        }
-
-        public func cancelDownload() {
-            guard let rx = rxCharacteristic else {
-                print("RX characteristic not found")
-                return
-            }
-
-            // Sending 0xFF to the RX characteristic
-            let cancelCommand = Data([0xFF])
-            connectedPeripheral?.peripheral.writeValue(cancelCommand, for: rx, type: .withoutResponse)
-            state = .idle
-        }
-
-        public func uploadFile(fileData: Data, remotePath: String, completion: @escaping (Result<Void, Error>) -> Void) {
-            guard let peripheral = connectedPeripheral?.peripheral,
-                  let rx = rxCharacteristic,
-                  let tx = txCharacteristic else {
-                completion(.failure(NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "No connected peripheral or RX characteristic"])))
-                return
-            }
-
-            // Initialize upload state
-            isUploading = true
-            fileDataToUpload = fileData
-            remotePathToUpload = remotePath
-            nextPacketNum = 0
-            nextAckNum = 0
-            lastPacketNum = nil
-            uploadProgress = 0.0
-
-            // Calculate total packets
-            let totalPacketsInt = Int(ceil(Double(fileData.count) / Double(frameLength)))
-            totalPackets = UInt32(totalPacketsInt)
-            print("Total packets to send: \(totalPackets)")
-
-            // Store the completion handler
-            self.uploadCompletion = completion
-
-            // Set up acknowledgment handler
-            setupAckHandler()
-
-            // Set up the notification handler
-            setupNotificationHandler(for: tx)
-
-            // Send upload command
-            guard let remotePathData = remotePath.data(using: .utf8) else {
-                completion(.failure(NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to encode remote path."])))
-                return
-            }
-
-            let command = Data([0x03]) + remotePathData // 0x03: Upload command
-            print("Sending upload command: \(command as NSData)")
-            peripheral.writeValue(command, for: rx, type: .withoutResponse)
-
-            // Start the main transfer loop
-            print("Upload command sent. Starting file transfer loop.")
-            startFileTransferLoop(peripheral: peripheral, rxCharacteristic: rx, txCharacteristic: tx)
-        }
-
-        private func setupAckHandler() {
-            // Subscribe to ackReceived publisher
-            uploadCancellable = ackReceived
-                .receive(on: DispatchQueue.main) // Ensure updates are on the main thread for UI changes
-                .sink { [weak self] ackNum in
-                    guard let self = self else { return }
-                    print("Received ACK for packet \(ackNum)")
-
-                    // Check if the ACK is for the expected packet
-                    if ackNum == self.nextAckNum % 256 {
-                        self.nextAckNum += 1
-                        self.uploadProgress = Float(self.nextAckNum) / Float(self.totalPackets)
-                        print("Updated nextAckNum to \(self.nextAckNum), uploadProgress: \(self.uploadProgress * 100)%")
-
-                        // Check if all packets have been acknowledged
-                        if let lastPacket = self.lastPacketNum, self.nextAckNum >= lastPacket {
-                            print("All packets acknowledged. Upload complete.")
-                            self.uploadCompletion?(.success(()))
-                            self.isUploading = false
-                            self.uploadTask?.cancel()
-                            self.notificationHandlers[self.txCharacteristic?.uuid ?? CBUUID()] = nil
-                            self.resetUploadState()
-                        }
-                    } else {
-                        print("Received out-of-order ACK: \(ackNum). Expected: \(self.nextAckNum)")
-                        // Optionally handle out-of-order ACKs here
-                    }
-                }
-        }
-
-        private func setupNotificationHandler(for characteristic: CBCharacteristic) {
-            // Avoid re-assigning the handler if it's already set
-            if notificationHandlers[characteristic.uuid] != nil {
-                print("Handler already set for characteristic \(characteristic.uuid)")
-                return
-            }
-
-            notificationHandlers[characteristic.uuid] = { [weak self] (peripheral, characteristic, error) in
-                guard let self = self else { return }
-                if let error = error {
-                    print("Error receiving notification: \(error.localizedDescription)")
-                    self.cancelUpload()
-                    return
-                }
-
-                guard let data = characteristic.value else {
-                    print("No data received in notification.")
-                    return
-                }
-
-                print("Received notification data: \(data as NSData) from characteristic \(characteristic.uuid)")
-
-                // Handle Data ACK (e.g., 0x12xx)
-                if data.count == 2 && data[0] == 0x12 {
-                    let ackNum = Int(data[1])
-                    print("Received Data ACK for packet \(ackNum)")
-                    self.ackReceived.send(ackNum)
-                }
-                // Handle Directory Entry (assuming fixed length, e.g., 24 bytes)
-                else if data.count == 24 {
-                    if let directoryEntry = self.parseDirectoryEntry(from: data) {
-                        DispatchQueue.main.async {
-                            self.directoryEntries.append(directoryEntry)
-                            self.sortDirectoryEntries()
-                            self.isAwaitingResponse = false
-                        }
-                    }
-                }
-                // Handle other notifications if necessary
-                else {
-                    print("Received unknown notification data: \(data as NSData)")
-                }
-            }
-
-            print("Handler set for characteristic \(characteristic.uuid)")
-        }
-
-        private func startFileTransferLoop(peripheral: CBPeripheral, rxCharacteristic: CBCharacteristic, txCharacteristic: CBCharacteristic) {
-            // Initialize the upload task
-            uploadTask = Task {
-                var uploadSucceeded = false
-                while isUploading && !Task.isCancelled {
-                    do {
-                        // Attempt to send packets within the window
-                        try await self.sendPacketsWithinWindow(peripheral: peripheral, rxCharacteristic: rxCharacteristic)
-                    } catch {
-                        if error is CancellationError {
-                            print("Upload task cancelled.")
-                            break // Exit the loop on cancellation
-                        } else {
-                            print("Caught error: \(error.localizedDescription)")
-                            print("Resending window starting at packet \(nextAckNum)")
-                            // Reset nextPacketNum to nextAckNum to resend the window
-                            nextPacketNum = nextAckNum
-                        }
-                    }
-
-                    // Wait for an acknowledgment or timeout
-                    do {
-                        try await withThrowingTaskGroup(of: Int.self) { group in
-                            // Add a task to wait for an ACK
-                            group.addTask {
-                                print("TaskGroup: Awaiting ACK...")
-                                let ackNum = try await self.awaitFirstMatchingAck()
-                                print("TaskGroup: Received ACK \(ackNum)")
-                                return ackNum
-                            }
-
-                            // Add a timeout task
-                            group.addTask {
-                                print("TaskGroup: Timeout task started.")
-                                try await Task.sleep(nanoseconds: UInt64(self.TX_TIMEOUT * 1_000_000_000))
-                                print("TaskGroup: Timeout occurred.")
-                                throw NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "ACK timeout"])
-                            }
-
-                            // Wait for either ACK or timeout
-                            if let ackNum = try await group.next() {
-                                print("TaskGroup: Received in group: \(ackNum)")
-                                group.cancelAll()
-                            }
-                        }
-                    } catch {
-                        if error is CancellationError {
-                            print("Upload task cancelled.")
-                            break // Exit the loop on cancellation
-                        }
-                        print("Caught error: \(error.localizedDescription)")
-                        print("Resending window starting at packet \(nextAckNum)")
-                        // Reset nextPacketNum to nextAckNum to resend the window
-                        nextPacketNum = nextAckNum
-                    }
-                }
-
-                // After exiting the loop, determine the outcome
-                if uploadSucceeded {
-                    print("Upload completed successfully.")
-                    self.uploadCompletion?(.success(()))
-                } else {
-                    print("Upload was cancelled or failed.")
-                    // uploadCompletion should have been called in cancelUpload or error handling
-                }
-
-                // Clean up
-                self.uploadTask?.cancel()
-                self.resetUploadState()
-            }
-        }
-
-        private func awaitFirstMatchingAck() async throws -> Int {
-            try await withCheckedThrowingContinuation { continuation in
-                // Subscribe to the ackReceived publisher
-                let cancellable = self.ackReceived
-                    .filter { $0 >= self.nextAckNum }
-                    .first()
-                    .sink(receiveCompletion: { [weak self] completion in
-                        guard let self = self else { return }
-                        self.ackContinuationLock.sync {
-                            if !self.isContinuationResumed {
-                                self.isContinuationResumed = true
-                                switch completion {
-                                case .finished:
-                                    // No action needed
-                                    break
-                                case .failure(let error):
-                                    continuation.resume(throwing: error)
-                                }
-                            }
-                        }
-                    }, receiveValue: { [weak self] ackNum in
-                        guard let self = self else { return }
-                        self.ackContinuationLock.sync {
-                            if !self.isContinuationResumed {
-                                self.isContinuationResumed = true
-                                continuation.resume(returning: ackNum)
-                            }
-                        }
-                    })
-
-                // Retain the cancellable to prevent it from being deallocated
-                self.continuationCancellables.insert(cancellable)
-
-                // Handle task cancellation
-                Task {
-                    do {
-                        try await Task.sleep(nanoseconds: UInt64.max)
-                        // This will never be called normally
-                    } catch {
-                        // Task was canceled
-                        self.ackContinuationLock.sync {
-                            if !self.isContinuationResumed {
-                                self.isContinuationResumed = true
-                                cancellable.cancel()
-                                continuation.resume(throwing: CancellationError())
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        private func sendPacketsWithinWindow(peripheral: CBPeripheral, rxCharacteristic: CBCharacteristic) async throws {
-            while nextPacketNum < nextAckNum + windowLength && (lastPacketNum == nil || nextPacketNum < lastPacketNum!) {
-                // Check if the upload is still active
-                if !isUploading || fileDataToUpload == nil {
-                    print("No more packets to send or upload not initialized.")
-                    throw CancellationError()
-                }
-
-                // Send the packet
-                sendPacket(peripheral: peripheral, rxCharacteristic: rxCharacteristic)
-
-                // Introduce a small non-blocking delay
-                do {
-                    try await Task.sleep(nanoseconds: 50_000_000) // 50 milliseconds
-                } catch {
-                    if error is CancellationError {
-                        print("Sleep interrupted: The operation couldn’t be completed. (Swift.CancellationError error 1.)")
-                    } else {
-                        print("Sleep interrupted: \(error.localizedDescription)")
-                    }
-                    // Re-throw the error to propagate cancellation
-                    throw error
-                }
-            }
-        }
-
-        private func sendPacket(peripheral: CBPeripheral, rxCharacteristic: CBCharacteristic) {
-            guard let fileData = fileDataToUpload else {
-                print("No file data to send.")
-                return
-            }
-
-            let startIndex = nextPacketNum * frameLength
-            let endIndex = min(startIndex + frameLength, fileData.count)
-
-            if startIndex < fileData.count {
-                // Send Data Packet
-                let dataSlice = fileData[startIndex..<endIndex]
-
-                // Construct the packet: [0x10][Packet Number][Data...]
-                var packetData = Data()
-                packetData.append(0x10) // 0x10 signifies the start of a data packet
-                packetData.append(UInt8(nextPacketNum % 256)) // Packet number modulo 256
-                packetData.append(dataSlice) // Actual data
-
-                // **Logging the First 10 Bytes**
-                let first10Bytes = packetData.prefix(10)
-                let hexString = first10Bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
-                print("Sending packet \(nextPacketNum): first 10 bytes: \(hexString)")
-
-                // Write the data packet with .withoutResponse	
-                peripheral.writeValue(packetData, for: rxCharacteristic, type: .withoutResponse)
-                print("Packet \(nextPacketNum) sent.")
-            }
-            else {
-                // Send Final Empty Packet
-                let packetData = Data([0x10, UInt8(nextPacketNum % 256)]) // [0x10][Packet Number]
-                peripheral.writeValue(packetData, for: rxCharacteristic, type: .withoutResponse)
-                print("Sending final empty packet \(nextPacketNum): \(packetData as NSData)")
-
-                // Now, set lastPacketNum after sending the empty packet
-                lastPacketNum = nextPacketNum + 1
-                print("Final empty packet sent. Setting lastPacketNum to \(lastPacketNum!)")
-            }
-
-            // Increment the packet number
-            nextPacketNum += 1
-        }
-
-        private func resetUploadState() {
-            DispatchQueue.main.async {
-                self.fileDataToUpload = nil
-                self.remotePathToUpload = nil
-                self.nextPacketNum = 0
-                self.nextAckNum = 0
-                self.lastPacketNum = nil
-                self.uploadProgress = 0.0
-                self.uploadTask = nil
-                self.uploadCancellable?.cancel()
-                self.uploadCancellable = nil
-                self.uploadCompletion = nil // Reset the completion handler
-            }
-        }
-
-        public func cancelUpload() {
-            guard isUploading else { return }
-            isUploading = false
-            uploadTask?.cancel()
-            uploadTask = nil
-            uploadCancellable?.cancel()
-            uploadCancellable = nil
-            print("Upload cancelled.")
-
-            // Send a cancel command to the device with .withoutResponse
-            if let peripheral = connectedPeripheral?.peripheral, let rx = rxCharacteristic {
-                let cancelCommand = Data([0xFF]) // Replace 0xFF with the correct cancel command byte if different
-                print("Sending cancel upload command: \(cancelCommand as NSData)")
-                peripheral.writeValue(cancelCommand, for: rx, type: .withoutResponse)
-            }
-
-            // Notify the completion handler about the cancellation BEFORE resetting the state
-            self.uploadCompletion?(.failure(NSError(domain: "FlySightCore", code: -2, userInfo: [NSLocalizedDescriptionKey: "Upload cancelled."])))
-
-            // Remove notification handler
-            if let txUUID = txCharacteristic?.uuid {
-                notificationHandlers[txUUID] = nil
-            }
-
-            // Reset upload state
-            resetUploadState()
         }
 
         private func startPingTimer() {
             stopPingTimer() // Ensure any existing timer is stopped
             DispatchQueue.main.async {
-                self.pingTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] timer in
+                // Run on main queue to interact with main-thread properties, but ping itself is BLE op.
+                self.pingTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
                     self?.sendPing()
                 }
-                print("Ping timer started")
+                print("Ping timer started.")
             }
         }
 
@@ -755,570 +1064,523 @@ public extension FlySightCore {
             }
         }
 
-        private func sendPing() {
-            guard let rx = rxCharacteristic else {
-                print("RX characteristic not found")
+
+        // MARK: - File System Operations
+        public func loadDirectoryEntries() {
+            guard let peripheral = connectedPeripheralInfo?.peripheral, let char = ftPacketInCharacteristic else {
+                print("Cannot load directory: Not connected or FT_Packet_In characteristic missing.")
+                DispatchQueue.main.async { self.isAwaitingDirectoryResponse = false }
                 return
             }
-            let pingCommand = Data([0xFE])
-            connectedPeripheral?.peripheral.writeValue(pingCommand, for: rx, type: .withoutResponse)
-            print("Ping sent")
-        }
-    }
-}
 
-extension FlySightCore.BluetoothManager: CBCentralManagerDelegate {
-    public func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        if central.state == .poweredOn {
-            central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        }
-    }
-
-    public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        DispatchQueue.main.async {
-            let isBonded = self.bondedDeviceIDs.contains(peripheral.identifier)
-            var shouldAdd = isBonded
-            var isPairingMode = false
-
-            if let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data, manufacturerData.count >= 3 {
-                let manufacturerId = (UInt16(manufacturerData[1]) << 8) | UInt16(manufacturerData[0])
-                if manufacturerId == 0x09DB {
-                    shouldAdd = true
-                    isPairingMode = (manufacturerData[2] & 0x01) != 0
-                }
-            }
-
-            if shouldAdd {
-                if let index = self.peripheralInfos.firstIndex(where: { $0.peripheral.identifier == peripheral.identifier }) {
-                    // Update existing PeripheralInfo
-                    self.peripheralInfos[index].rssi = RSSI.intValue
-                    self.peripheralInfos[index].isPairingMode = isPairingMode
-                    if !isBonded {  // Only reset timer for non-bonded devices
-                        self.resetTimer(for: self.peripheralInfos[index])
-                    }
-                } else {
-                    // Create and add new PeripheralInfo
-                    let newPeripheralInfo = FlySightCore.PeripheralInfo(
-                        peripheral: peripheral,
-                        rssi: RSSI.intValue,
-                        name: peripheral.name ?? "Unnamed Device",
-                        isConnected: false,
-                        isPairingMode: isPairingMode
-                    )
-                    self.peripheralInfos.append(newPeripheralInfo)
-                    if !isBonded {
-                        self.startDisappearanceTimer(for: newPeripheralInfo)
-                    }
-                }
-                // Sort peripherals after adding/updating
-                self.sortPeripheralsByRSSI()
-            }
-        }
-    }
-
-    public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        print("Connected to \(peripheral.name ?? "Unknown Device") (peripheral ID = \(peripheral.identifier))")
-
-        // Set this object as the delegate for the peripheral to receive peripheral delegate callbacks.
-        peripheral.delegate = self
-
-        // Optionally start discovering services or characteristics here
-        peripheral.discoverServices(nil)  // Passing nil will discover all services
-
-        // Update isPairingMode flag and isConnected status
-        if let index = peripheralInfos.firstIndex(where: { $0.peripheral.identifier == peripheral.identifier }) {
-            peripheralInfos[index].isPairingMode = false  // Clear pairing mode flag
-            peripheralInfos[index].isConnected = true      // Update connection status
-
-            // Optionally, you might want to perform additional actions here, such as notifying other parts of your app
-        }
-
-        // Re-sort the peripherals list to reflect the updated pairing mode status
-        sortPeripheralsByRSSI()
-    }
-
-    public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        print("Disconnected from \(peripheral.name ?? "Unknown Device") (peripheral ID = \(peripheral.identifier))")
-
-        // Reset the characteristic references
-        rxCharacteristic = nil
-        txCharacteristic = nil
-        pvCharacteristic = nil
-        spControlPointCharacteristic = nil
-        resultCharacteristic = nil
-        sdControlPointCharacteristic = nil
-        lastAttemptedGNSSMask = nil
-        DispatchQueue.main.async {
-             self.gnssMaskUpdateStatus = .idle
-        }
-
-        // Stop the ping timer
-        stopPingTimer()
-
-        // Initialize current path
-        currentPath = []
-
-        // Reset the directory listings
-        directoryEntries = []
-
-        // Reset other states as needed
-        if isUploading {
-            cancelUpload()
-        }
-    }
-}
-
-extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
-    public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        // 1. Handle errors first
-        guard error == nil, let data = characteristic.value else {
-            isAwaitingResponse = false // Reset for directory listing if that was the expectation
-            print("Error reading characteristic: \(characteristic.uuid) - \(error?.localizedDescription ?? "Unknown error")")
-
-            // If this error is for GNSS_CONTROL_UUID after a GET_MASK or SET_MASK attempt
-            if characteristic.uuid == SD_CONTROL_POINT_UUID { // <--- CORRECTED
-                DispatchQueue.main.async {
-                    self.gnssMaskUpdateStatus = FlySightCore.GNSSMaskUpdateStatus.failure("Failed to read/receive update from SD Control Point: \(error?.localizedDescription ?? "Unknown error")")
-                    self.lastAttemptedGNSSMask = nil
-                    // Optionally, re-fetch mask if appropriate here
-                    // if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
-                }
-            }
-
-            // If a specific notification handler exists (like for downloads/uploads), pass the error to it
-            if let handler = notificationHandlers[characteristic.uuid] {
-                handler(peripheral, characteristic, error) // Notify handler of the error
-            }
-            return
-        }
-
-        // 2. Check for specific, non-handler-based characteristic updates first
-        var handledBySpecificLogic = false
-        if characteristic.uuid == CRS_TX_UUID {
-            // This UUID is used for both directory entries AND file download/upload notifications.
-            // Try parsing as directory entry first.
-            // The notification handler for download/upload will also be checked later if it exists.
             DispatchQueue.main.async {
-                if let directoryEntry = self.parseDirectoryEntry(from: data) {
-                    self.directoryEntries.append(directoryEntry)
-                    self.sortDirectoryEntries()
-                    self.isAwaitingResponse = false // Directory entry received
-                    handledBySpecificLogic = true
-                    // print("Processed as directory entry: \(directoryEntry.name)")
-                }
-                // If not a directory entry, it might be a file transfer packet,
-                // which will be handled by the notificationHandlers check below.
+                self.directoryEntries = []
+                self.isAwaitingDirectoryResponse = true
             }
-        } else if characteristic.uuid == START_RESULT_UUID { // This is for SP_Result
-            processStartResult(data: data)
-            handledBySpecificLogic = true
-            // print("Processed START_RESULT_UUID (SP_Result)")
-        } else if characteristic.uuid == GNSS_PV_UUID { // This is SD_GNSS_Measurement
-            parseLiveGNSSData(from: data)
-            handledBySpecificLogic = true
-            // print("Processed GNSS_PV_UUID (SD_GNSS_Measurement)")
-        } else if characteristic.uuid == SD_CONTROL_POINT_UUID { // Was GNSS_CONTROL_UUID
-            processSDControlPointResponse(from: data) // Call updated function
-            handledBySpecificLogic = true
-            // print("Processed SD_CONTROL_POINT_UUID")
-        } else if characteristic.uuid == SP_CONTROL_POINT_UUID { // Was START_CONTROL_UUID, now for indications
-            processSPControlPointResponse(from: data) // Call new function
-            handledBySpecificLogic = true
-            // print("Processed SP_CONTROL_POINT_UUID")
+
+            let pathString = "/" + currentPath.joined(separator: "/")
+            print("Requesting directory listing for: \(pathString)")
+            var command = Data([0x05]) // List Directory Opcode
+            command.append(pathString.data(using: .utf8) ?? Data())
+            command.append(0x00) // Null terminator
+
+            peripheral.writeValue(command, for: char, type: .withoutResponse)
         }
 
-        // 3. Check for registered notification handlers (e.g., for file download/upload on CRS_TX_UUID)
-        // This allows CRS_TX_UUID to serve dual purposes if needed.
-        if let handler = notificationHandlers[characteristic.uuid] {
-            // print("Calling notification handler for \(characteristic.uuid)")
-            handler(peripheral, characteristic, error) // 'error' will be nil here if we passed the guard above
-        } else if !handledBySpecificLogic {
-            // Only print "No handler" if it wasn't handled by specific logic AND no general handler was found.
-            // This avoids "No handler" messages for characteristics that ARE handled by the specific blocks above
-            // but don't ALSO have a separate entry in `notificationHandlers`.
-            // print("No specific logic or notification handler for characteristic \(characteristic.uuid). Data: \(data.hexEncodedString())")
-        }
-    }
-	    
-    public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        if let error = error {
-            print("Write error for characteristic \(characteristic.uuid): \(error.localizedDescription)")
-            if isUploading { // Existing logic for upload
-                cancelUpload()
+        // Corrected parseDirectoryEntry based on new understanding of payload
+        private func parseDirectoryEntry(from characteristicValue: Data) -> DirectoryEntry? {
+            // characteristicValue is the full data from FT_Packet_Out notification
+            // Opcode (1 byte) | PacketCounter (1 byte) | Payload (22 bytes)
+            // Payload: Size(u32), Date(u16), Time(u16), Attr(u8), Name(13 bytes, null-padded)
+
+            guard characteristicValue.count >= 3, characteristicValue[0] == 0x11 else {
+                // print("parseDirectoryEntry: Not a File Info packet (0x11) or too short. Got: \(characteristicValue.hexEncodedString())")
+                return nil
             }
-            if characteristic.uuid == SD_CONTROL_POINT_UUID { // Was GNSS_CONTROL_UUID
-                DispatchQueue.main.async {
-                    if self.gnssMaskUpdateStatus == .pending { // Only update if a request was actually pending
-                        self.gnssMaskUpdateStatus = .failure("Write failed for SD Control Point: \(error.localizedDescription)")
-                    }
-                    self.lastAttemptedGNSSMask = nil // Clear any pending mask value
-                    // Attempt to re-sync with the actual device state, as the write failed
-                    if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
-                }
+
+            // let packetCounter = characteristicValue[1] // Currently unused here
+            let payload = characteristicValue.subdata(in: 2..<characteristicValue.count) // From index 2 to end
+
+            guard payload.count >= 22 else { // Minimum length for the defined payload
+                print("parseDirectoryEntry: Payload too short. Expected 22 bytes, got \(payload.count)")
+                return nil
             }
-            return
-        }
-        
-        print("Write successful for characteristic \(characteristic.uuid)")
 
-        // Since writes are without response, rely on notifications for flow control
-        // No further action needed here unless implementing additional logic
-    }
+            let size: UInt32 = payload.subdata(in: 0..<4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            let fdate: UInt16 = payload.subdata(in: 4..<6).withUnsafeBytes { $0.load(as: UInt16.self) }
+            let ftime: UInt16 = payload.subdata(in: 6..<8).withUnsafeBytes { $0.load(as: UInt16.self) }
+            let fattrib: UInt8 = payload.subdata(in: 8..<9).withUnsafeBytes { $0.load(as: UInt8.self) }
 
-    public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        if let error = error {
-            print("Notification state error for \(characteristic.uuid): \(error.localizedDescription)")
-        } else {
-            print("Notifications enabled for \(characteristic.uuid)")
-        }
-    }
+            let nameBytes = payload.subdata(in: 9..<(9+13)) // 13 bytes for name
 
-    public func sortDirectoryEntries() {
-        directoryEntries.sort {
-            if $0.isFolder != $1.isFolder {
-                return $0.isFolder && !$1.isFolder
+            // Check for end-of-list marker (Name[0] == 0)
+            if nameBytes[0] == 0 {
+                return DirectoryEntry(size: 0, date: Date(timeIntervalSince1970: 0), attributes: "", name: "", isEmptyMarker: true)
             }
-            return $0.name.lowercased() < $1.name.lowercased()
-        }
-    }
 
-    public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        if let error = error {
-            print("Error discovering services: \(error.localizedDescription)")
-            return
-        }
-
-        guard let services = peripheral.services else { return }
-        for service in services {
-            peripheral.discoverCharacteristics(nil, for: service)
-        }
-    }
-
-    public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard error == nil else {
-            print("Error discovering characteristics: \(error!.localizedDescription)")
-            return
-        }
-
-        if let characteristics = service.characteristics {
-            for characteristic in characteristics {
-                if characteristic.uuid == CRS_TX_UUID {
-                    txCharacteristic = characteristic
-                    print("TX Characteristic found: \(characteristic.uuid)")
-
-                    // Enable notifications
-                    peripheral.setNotifyValue(true, for: characteristic)
-                } else if characteristic.uuid == CRS_RX_UUID {
-                    rxCharacteristic = characteristic
-                    print("RX Characteristic found: \(characteristic.uuid)")
-
-                    // Read to force pairing
-                    peripheral.readValue(for: characteristic)
-                } else if characteristic.uuid == GNSS_PV_UUID {
-                    pvCharacteristic = characteristic
-                    peripheral.setNotifyValue(true, for: characteristic) // Enable notifications for PV
-                    print("GNSS PV Characteristic found: \(characteristic.uuid)")
-                } else if characteristic.uuid == SP_CONTROL_POINT_UUID { // NEW (was START_CONTROL_UUID)
-                    spControlPointCharacteristic = characteristic
-                    peripheral.setNotifyValue(true, for: characteristic) // Enable indications
-                    print("SP Control Point Characteristic found: \(characteristic.uuid)")
-                } else if characteristic.uuid == START_RESULT_UUID { // This is SP_Result
-                    resultCharacteristic = characteristic
-                    peripheral.setNotifyValue(true, for: characteristic)
-                    print("SP Result Characteristic found: \(characteristic.uuid)")
-                } else if characteristic.uuid == SD_CONTROL_POINT_UUID { // NEW (was GNSS_CONTROL_UUID)
-                    sdControlPointCharacteristic = characteristic
-                    peripheral.setNotifyValue(true, for: characteristic) // Enable indications
-                    print("SD Control Point Characteristic found: \(characteristic.uuid)")
-                }
+            let firstNull = nameBytes.firstIndex(of: 0) ?? nameBytes.endIndex
+            let actualNameData = nameBytes.subdata(in: nameBytes.startIndex..<firstNull)
+            guard let name = String(data: actualNameData, encoding: .utf8), !name.isEmpty else {
+                print("parseDirectoryEntry: Could not decode name or name is empty.")
+                return nil
             }
-            if txCharacteristic != nil && rxCharacteristic != nil && pvCharacteristic != nil &&
-               sdControlPointCharacteristic != nil && spControlPointCharacteristic != nil && resultCharacteristic != nil && // ensure all are found
-               pingTimer == nil {
-                loadDirectoryEntries()
-                startPingTimer()
-                fetchGNSSMask() // Good place to fetch initial mask
+
+            let year = Int((fdate >> 9) & 0x7F) + 1980
+            let month = Int((fdate >> 5) & 0x0F)
+            let day = Int(fdate & 0x1F)
+            let hour = Int((ftime >> 11) & 0x1F)
+            let minute = Int((ftime >> 5) & 0x3F)
+            let second = Int((ftime & 0x1F) * 2)
+
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+            guard let date = calendar.date(from: DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second)) else {
+                return nil
             }
+
+            // FAT attributes: Bit 0 RO, 1 Hidden, 2 System, 3 Vol Label, 4 Dir, 5 Archive
+            var attribText = ""
+            attribText += (fattrib & 0x10) != 0 ? "d" : "-" // Directory
+            attribText += (fattrib & 0x20) != 0 ? "a" : "-" // Archive
+            attribText += (fattrib & 0x01) != 0 ? "r" : "-" // Read-only
+            attribText += (fattrib & 0x02) != 0 ? "h" : "-" // Hidden
+            attribText += (fattrib & 0x04) != 0 ? "s" : "-" // System
+
+            return DirectoryEntry(size: size, date: date, attributes: attribText, name: name)
         }
-    }
-}
 
-extension FlySightCore.BluetoothManager {
-    var bondedDeviceIDsKey: String { "bondedDeviceIDs" }
-
-    var bondedDeviceIDs: Set<UUID> {
-        get {
-            Set((UserDefaults.standard.array(forKey: bondedDeviceIDsKey) as? [String])?.compactMap(UUID.init) ?? [])
-        }
-        set {
-            UserDefaults.standard.set(Array(newValue.map { $0.uuidString }), forKey: bondedDeviceIDsKey)
-        }
-    }
-
-    public func addBondedDevice(_ peripheral: CBPeripheral) {
-        var currentBonded = bondedDeviceIDs
-        currentBonded.insert(peripheral.identifier)
-        bondedDeviceIDs = currentBonded
-    }
-
-    public func removeBondedDevice(_ peripheral: CBPeripheral) {
-        var currentBonded = bondedDeviceIDs
-        currentBonded.remove(peripheral.identifier)
-        bondedDeviceIDs = currentBonded
-    }
-}
-
-extension FlySightCore.BluetoothManager {
-    public func fetchGNSSMask() {
-        guard let peripheral = connectedPeripheral?.peripheral, let controlChar = sdControlPointCharacteristic else { // Use sdControlPointCharacteristic
-            print("Cannot fetch GNSS mask: No connected peripheral or SD Control Point characteristic.")
+        public func changeDirectory(to newDirectoryName: String) {
+            guard connectedPeripheralInfo != nil else { return }
             DispatchQueue.main.async {
-                self.gnssMaskUpdateStatus = .failure("SD Control Point characteristic not available.")
+                self.currentPath.append(newDirectoryName)
+                self.loadDirectoryEntries()
             }
-            return
         }
 
-        let command = Data([FlySightCore.SDControlOpcodes.getMask]) // Use SDControlOpcodes
-        print("Fetching GNSS Mask...")
-        DispatchQueue.main.async {
-            self.gnssMaskUpdateStatus = .pending
-        }
-        peripheral.writeValue(command, for: controlChar, type: .withResponse)
-    }
-
-    public func updateGNSSMask(newMask: UInt8) {
-        guard let peripheral = connectedPeripheral?.peripheral, let controlChar = sdControlPointCharacteristic else { // Use sdControlPointCharacteristic
-            print("Cannot update GNSS mask: No connected peripheral or SD Control Point characteristic.")
+        public func goUpOneDirectoryLevel() {
+            guard connectedPeripheralInfo != nil, !currentPath.isEmpty else { return }
             DispatchQueue.main.async {
-                self.gnssMaskUpdateStatus = .failure("SD Control Point characteristic not available.")
+                _ = self.currentPath.popLast()
+                self.loadDirectoryEntries()
             }
-            return
         }
 
-        self.lastAttemptedGNSSMask = newMask
 
-        let command = Data([FlySightCore.SDControlOpcodes.setMask, newMask]) // Use SDControlOpcodes
-        print("Attempting to update GNSS Mask to: \(String(format: "0x%02X", newMask))")
-        DispatchQueue.main.async {
-            self.gnssMaskUpdateStatus = .pending
-        }
-        peripheral.writeValue(command, for: controlChar, type: .withResponse)
-    }
-    
-    private func parseLiveGNSSData(from data: Data) {
-        guard data.count > 0 else {
-            print("Received empty GNSS PV data.")
-            return
-        }
+        // MARK: - Download and Upload (GBN ARQ)
+        // (Keep existing downloadFile, cancelDownload methods, ensuring they use
+        // connectedPeripheralInfo.peripheral and ftPacketIn/OutCharacteristic)
+        // For uploadFile, let's refine the GBN ARQ implementation slightly for clarity if needed.
 
-        var offset = 0
-        let receivedMask = data[offset]; offset += 1
-        // print("Received GNSS Live Data with mask: \(String(format: "0x%02X", receivedMask))")
-
-        var tow: UInt32?
-        // var week: UInt16? // Not in current firmware packet
-        var lon: Int32?
-        var lat: Int32?
-        var hMSL: Int32?
-        var velN: Int32?
-        var velE: Int32?
-        var velD: Int32?
-        var hAcc: UInt32?
-        var vAcc: UInt32?
-        var sAcc: UInt32?
-        var numSV: UInt8?
-
-        if (receivedMask & FlySightCore.GNSSLiveMaskBits.timeOfWeek != 0) {
-            guard data.count >= offset + 4 else { return }
-            tow = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
-            offset += 4
-        }
-
-        // Week number is part of the mask definition but not included in the current firmware's GNSS_PV payload.
-        // if (receivedMask & FlySightCore.GNSSLiveMaskBits.weekNumber != 0) {
-        //     guard data.count >= offset + 2 else { return }
-        //     week = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }
-        //     offset += 2
-        // }
-
-        if (receivedMask & FlySightCore.GNSSLiveMaskBits.position != 0) {
-            guard data.count >= offset + 12 else { return }
-            lon = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
-            offset += 4
-            lat = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
-            offset += 4
-            hMSL = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
-            offset += 4
-        }
-
-        if (receivedMask & FlySightCore.GNSSLiveMaskBits.velocity != 0) {
-            guard data.count >= offset + 12 else { return }
-            velN = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
-            offset += 4
-            velE = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
-            offset += 4
-            velD = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
-            offset += 4
-        }
-
-        if (receivedMask & FlySightCore.GNSSLiveMaskBits.accuracy != 0) {
-            guard data.count >= offset + 12 else { return }
-            // Note: Firmware `GNSS_BLE_Build` for accuracy seems to copy velN, velE, velD again.
-            // This should be src->hAcc, src->vAcc, src->sAcc. Assuming firmware gets fixed or use as is.
-            // For now, parsing as if they are hAcc, vAcc, sAcc.
-            hAcc = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
-            offset += 4
-            vAcc = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
-            offset += 4
-            sAcc = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
-            offset += 4
-        }
-
-        if (receivedMask & FlySightCore.GNSSLiveMaskBits.numSV != 0) {
-            guard data.count >= offset + 1 else { return }
-            // Note: Firmware `GNSS_BLE_Build` for numSV seems to copy velN.
-            // This should be src->numSV. Assuming firmware gets fixed or use as is.
-            numSV = data[offset] // Assuming it's a UInt8
-            offset += 1
-        }
-
-        DispatchQueue.main.async {
-            self.liveGNSSData = FlySightCore.LiveGNSSData(mask: receivedMask,
-                                                          timeOfWeek: tow,
-                                                          longitude: lon, latitude: lat, heightMSL: hMSL,
-                                                          velocityNorth: velN, velocityEast: velE, velocityDown: velD,
-                                                          horizontalAccuracy: hAcc, verticalAccuracy: vAcc, speedAccuracy: sAcc,
-                                                          numSV: numSV)
-        }
-    }
-
-    private func processSDControlPointResponse(from data: Data) {
-        guard data.count >= 3, data[0] == FlySightCore.CP_RESPONSE_ID else {
-            print("Invalid SD Control Point response: Missing 0xF0 prefix or too short. Data: \(data.hexEncodedString())")
-            DispatchQueue.main.async {
-                if self.gnssMaskUpdateStatus == .pending { // Only update if a request was actually pending
-                    self.gnssMaskUpdateStatus = .failure("Invalid response format from device.")
-                }
-                self.lastAttemptedGNSSMask = nil
-                // Avoid fetch storm if not connected or characteristic is nil
-                if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil {
-                    self.fetchGNSSMask() // Attempt to re-sync
-                }
-            }
-            return
-        }
-
-        let requestOpcode = data[1]
-        let status = data[2]
-
-        // Handle GET_MASK response
-        if requestOpcode == FlySightCore.SDControlOpcodes.getMask {
-            guard status == FlySightCore.CP_STATUS.success else {
-                print("GET_MASK failed with status: \(status)")
-                DispatchQueue.main.async {
-                    if self.gnssMaskUpdateStatus == .pending {
-                        self.gnssMaskUpdateStatus = .failure("GET_MASK failed (status: \(status)).")
-                    }
-                }
+        public func downloadFile(named filePath: String, knownSize: UInt32, completion: @escaping (Result<Data, Error>) -> Void) {
+            guard let peripheral = connectedPeripheralInfo?.peripheral,
+                  let rxChar = ftPacketInCharacteristic, // To send ACKs to
+                  let txChar = ftPacketOutCharacteristic  // To receive data from (FT_Packet_Out)
+            else {
+                completion(.failure(BluetoothError.notConnectedOrCharsMissing))
                 return
             }
-            guard data.count >= 4 else { // 0xF0, Opcode, Status, MaskValue == 4 bytes
-                print("Invalid GET_MASK response length (after 0xF0 prefix). Expected at least 4 bytes. Data: \(data.hexEncodedString())")
-                DispatchQueue.main.async {
-                    if self.gnssMaskUpdateStatus == .pending {
-                        self.gnssMaskUpdateStatus = .failure("Invalid GET_MASK response length.")
-                    }
+
+            var fileData = Data()
+            var expectedPacketNum: UInt8 = 0 // Packet counter for GBN is 1-byte
+            let transferCompleteSubject = PassthroughSubject<Void, Error>()
+
+            DispatchQueue.main.async {
+                self.downloadProgress = 0.0
+                self.currentFileSize = knownSize
+            }
+
+            // Setup notification handler for FT_Packet_Out (txChar)
+            notificationHandlers[txChar.uuid] = { [weak self] (p, char, err) in
+                guard let self = self else { return }
+
+                if let error = err {
+                    transferCompleteSubject.send(completion: .failure(error))
+                    return
                 }
-                return
-            }
-            let mask = data[3]
-            DispatchQueue.main.async {
-                self.currentGNSSMask = mask
-                self.gnssMaskUpdateStatus = .idle // Success, now idle
-                print("Successfully fetched GNSS Mask: \(String(format: "0x%02X", mask))")
-            }
-        }
-        // Handle SET_MASK response
-        else if requestOpcode == FlySightCore.SDControlOpcodes.setMask {
-            DispatchQueue.main.async {
-                if status == FlySightCore.CP_STATUS.success {
-                    if let attemptedMask = self.lastAttemptedGNSSMask {
-                        self.currentGNSSMask = attemptedMask // Update with the successfully set value
-                        print("Successfully set GNSS Mask to: \(String(format: "0x%02X", attemptedMask))")
+                guard let data = char.value, data.count >= 2, data[0] == 0x10 /* File Data Read Chunk */ else {
+                    // Could be other FT_Packet_Out types if not filtered earlier, or malformed.
+                    // if data != nil && data.count > 0 && data[0] != 0x10 {
+                    //    print("Download: Received non-0x10 packet on FT_Packet_Out: \(data.hexEncodedString())")
+                    // }
+                    return
+                }
+
+                let receivedPacketNum = data[1]
+
+                if receivedPacketNum == expectedPacketNum {
+                    let actualData = data.count > 2 ? data.subdata(in: 2..<data.count) : Data()
+
+                    if actualData.isEmpty && data.count == 2 { // Zero-length data signals EOF (data[0]=0x10, data[1]=counter)
+                        print("Download: EOF received for packet \(receivedPacketNum).")
+                        // ACK this final empty packet
+                        let ackPacket = Data([0x12, receivedPacketNum])
+                        p.writeValue(ackPacket, for: rxChar, type: .withoutResponse)
+                        transferCompleteSubject.send(completion: .finished)
                     } else {
-                        // This case should ideally not happen if lastAttemptedGNSSMask was set.
-                        if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
-                        print("Successfully set GNSS Mask, but last attempted mask was nil. Re-fetching.")
+                        fileData.append(actualData)
+                        expectedPacketNum = expectedPacketNum &+ 1 // Increment and wrap for UInt8
+
+                        let ackPacket = Data([0x12, receivedPacketNum])
+                        p.writeValue(ackPacket, for: rxChar, type: .withoutResponse)
+
+                        DispatchQueue.main.async {
+                            if self.currentFileSize > 0 {
+                                self.downloadProgress = Float(fileData.count) / Float(self.currentFileSize)
+                            }
+                        }
+                        // print("Download: Received packet \(receivedPacketNum), acked. Total bytes: \(fileData.count)")
                     }
-                    self.gnssMaskUpdateStatus = .idle // Success, now idle
                 } else {
-                    var errorMsg = "SET_MASK failed (status: \(status))."
-                    if status == FlySightCore.CP_STATUS.invalidParameter { errorMsg = "SET_MASK failed: Invalid Parameter." }
-                    else if status == FlySightCore.CP_STATUS.operationNotPermitted { errorMsg = "SET_MASK failed: Operation Not Permitted." }
-                    else if status == FlySightCore.CP_STATUS.busy { errorMsg = "SET_MASK failed: Device Busy." }
-                    else if status == FlySightCore.CP_STATUS.cmdNotSupported { errorMsg = "SET_MASK failed: Command Not Supported." }
-
-
-                    print("Failed to set GNSS Mask: \(errorMsg)")
-                    if self.gnssMaskUpdateStatus == .pending {
-                        self.gnssMaskUpdateStatus = .failure(errorMsg)
-                    }
-                    // If SET_MASK failed, re-fetch the actual current mask from the device
-                    if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
+                    print("Download: Out-of-order packet. Expected \(expectedPacketNum), got \(receivedPacketNum). Discarding.")
+                    // GBN receiver just ACKs in-order packets and discards others. Sender handles retransmission.
                 }
-                self.lastAttemptedGNSSMask = nil // Clear the stored attempted mask
             }
-        } else {
-            print("Received unknown opcode \(requestOpcode) in SD Control Point response: \(data.hexEncodedString())")
+
+            let fullPath = (currentPath + [filePath]).joined(separator: "/")
+            print("Requesting download for: \(fullPath)")
+            // Command: 0x02 [Offset_mult(u32)] [Stride-1_mult(u32)] [Path (null-term string)]
+            var command = Data([0x02])
+            command.append(UInt32(0).littleEndianData) // Offset_multiplier = 0
+            command.append(UInt32(0).littleEndianData) // Stride_minus_1_multiplier = 0 (so Stride = 1 * FRAME_LENGTH)
+            command.append(fullPath.data(using: .utf8) ?? Data())
+            command.append(0x00) // Null terminator
+
+            peripheral.writeValue(command, for: rxChar, type: .withoutResponse) // Send command to FT_Packet_In
+
+            // Subscribe to transfer completion
+            let cancellable = transferCompleteSubject.sink(receiveCompletion: { [weak self] resultCompletion in
+                self?.notificationHandlers[txChar.uuid] = nil // Clear handler
+                DispatchQueue.main.async { self?.downloadProgress = 0.0 }
+                switch resultCompletion {
+                case .failure(let error): completion(.failure(error))
+                case .finished: completion(.success(fileData))
+                }
+            }, receiveValue: { _ in })
+            cancellable.store(in: &cancellables) // Manage subscription
+        }
+
+        public func cancelDownload() { // Or any ongoing file transfer
+            guard let peripheral = connectedPeripheralInfo?.peripheral, let char = ftPacketInCharacteristic else { return }
+            let cancelCommand = Data([0xFF]) // Cancel Transfer Opcode
+            peripheral.writeValue(cancelCommand, for: char, type: .withoutResponse)
             DispatchQueue.main.async {
-                if self.gnssMaskUpdateStatus == .pending {
-                    self.gnssMaskUpdateStatus = .failure("Unknown response opcode from device.")
-                }
-                self.lastAttemptedGNSSMask = nil
+                self.downloadProgress = 0.0
+                // Also cancel any ongoing GBN subscriptions or clear handlers
+                // The transferCompleteSubject's sink will be cancelled by `cancellables.removeAll()` if manager deinitializes,
+                // but for explicit cancel, we might need to manage the specific download cancellable.
             }
-        }
-    }
-
-    private func processSPControlPointResponse(from data: Data) {
-        guard data.count >= 3, data[0] == FlySightCore.CP_RESPONSE_ID else {
-            print("Invalid SP Control Point response: Missing 0xF0 prefix or too short. Data: \(data.hexEncodedString())")
-            // If a command was expected, this is an error.
-            // Consider updating state if it was optimistically set.
-            // For now, just log. The UI relies on `self.state`.
-            return
+            print("Sent Cancel Transfer command.")
         }
 
-        let requestOpcode = data[1]
-        let status = data[2]
 
-        DispatchQueue.main.async {
-            if requestOpcode == FlySightCore.SPControlOpcodes.startCountdown {
-                if status == FlySightCore.CP_STATUS.success {
-                    print("Start Countdown command acknowledged successfully.")
-                    self.state = .counting // Update state on successful ACK
-                } else {
-                    print("Start Countdown command failed with status: \(status). Current state: \(self.state)")
-                    // If start fails, and we weren't already successfully counting (e.g. from a button press on device itself),
-                    // ensure state is idle.
-                    if self.state != .counting {
-                       self.state = .idle
+        public func uploadFile(fileData: Data, remotePath: String) async throws {
+             guard let peripheral = connectedPeripheralInfo?.peripheral,
+                  let rxChar = ftPacketInCharacteristic, // To send data chunks (0x10) and OpenFile (0x03)
+                  let txChar = ftPacketOutCharacteristic  // To receive ACKs (0x12) for data chunks
+            else {
+                throw BluetoothError.notConnectedOrCharsMissing
+            }
+
+            return try await withCheckedThrowingContinuation { [weak self] continuation in
+                guard let self = self else {
+                    continuation.resume(throwing: BluetoothError.deallocated)
+                    return
+                }
+
+                self.isUploading = true
+                self.fileDataToUpload = fileData
+                self.remotePathToUpload = remotePath // Full path from root
+                self.nextPacketNum = 0 // Packet counter (0-255 for 1-byte field) for data packets to send
+                self.nextAckNum = 0    // Next ACK we expect for the data packets we send
+                self.lastPacketNum = nil // Marks the packet *after* the final data packet (which might be an empty one)
+                self.totalPacketsToSend = UInt32(ceil(Double(fileData.count) / Double(self.frameLength)))
+                if fileData.isEmpty { self.totalPacketsToSend = 1 } // Send one empty data packet for empty file
+
+                self.uploadContinuation = continuation // Store for later resumption
+
+                DispatchQueue.main.async {
+                    self.uploadProgress = 0.0
+                }
+
+                // 1. Setup ACK handler for FT_Packet_Out (txChar)
+                // This handler listens for 0x12 (ACK File Data Packet) from FlySight
+                self.notificationHandlers[txChar.uuid] = { [weak self] (p, char, err) in
+                    guard let self = self, self.isUploading else { return }
+
+                    if let error = err {
+                        self.handleUploadCompletion(result: .failure(error))
+                        return
                     }
-                    // Optionally publish an error message for the UI
+                    guard let data = char.value, data.count == 2, data[0] == 0x12 /* ACK File Data */ else {
+                        // Could be other FT_Packet_Out types. If it's a NAK for the OpenFile, that's handled below too.
+                        return
+                    }
+
+                    let ackedPacketNum = Int(data[1]) // This is the PacketCounter from the 0x10 packet we sent
+
+                    // GBN: Cumulative ACK implies all packets up to (ackedPacketNum - 1) are received.
+                    // FlySight sends ACK for each packet. We are interested if it ACKs our `nextAckNum`.
+                    // If we receive an ACK for packet `N`, it means `N` was received.
+                    // We can then slide our window if `N` was the base of our window (`nextAckNum`).
+
+                    if ackedPacketNum == (self.nextAckNum % 256) { // Modulo for comparison with 1-byte counter
+                        self.nextAckNum += 1
+                        DispatchQueue.main.async {
+                            if self.totalPacketsToSend > 0 {
+                                self.uploadProgress = Float(self.nextAckNum) / Float(self.totalPacketsToSend)
+                            }
+                        }
+                        // If this was the last packet's ACK, complete the upload
+                        if let lastSent = self.lastPacketNum, self.nextAckNum >= lastSent {
+                            self.handleUploadCompletion(result: .success(()))
+                        } else {
+                            // Try to send more packets from the new window
+                            Task { await self.sendUploadDataPackets(peripheral: p, rxChar: rxChar) }
+                        }
+                    } else {
+                        // Out of order ACK or duplicate ACK, GBN sender usually ignores or handles timeouts.
+                        // For simplicity, we primarily rely on sending new window data when an expected ACK comes in
+                        // or when a timeout occurs (handled by a conceptual timer per GBN window base).
+                        // Since we don't have explicit GBN timers here, we re-send window on ACK or new send opportunity.
+                        print("Upload: Received ACK for \(ackedPacketNum), expected for \(self.nextAckNum % 256).")
+                    }
                 }
-            } else if requestOpcode == FlySightCore.SPControlOpcodes.cancelCountdown {
-                if status == FlySightCore.CP_STATUS.success {
-                    print("Cancel Countdown command acknowledged successfully.")
-                    self.state = .idle // Update state on successful ACK
-                    self.startResultDate = nil // Clear any pending/received start result if cancel is confirmed by FlySight
-                } else {
-                    print("Cancel Countdown command failed with status: \(status). Current state: \(self.state)")
-                    // If cancel fails, we are likely still in .counting state.
-                    // No change to self.state here, as a failed cancel means the device might still be counting.
-                    // Optionally publish an error message for the UI
+
+                // 2. Send "Write File (Open)" command to FT_Packet_In (rxChar)
+                var openCommand = Data([0x03]) // Write File (Open) Opcode
+                openCommand.append(remotePath.data(using: .utf8) ?? Data())
+                openCommand.append(0x00) // Null terminator
+
+                peripheral.writeValue(openCommand, for: rxChar, type: .withoutResponse)
+                print("Upload: Sent OpenFile command for \(remotePath).")
+
+                // Now, we wait for an ACK (0xf1 03) or NAK (0xf0 03) for the Open command on FT_Packet_Out (txChar).
+                // This specific ACK/NAK for Open isn't directly handled by the GBN data ACK handler above.
+                // Let's add a temporary handler or a way to confirm Open success.
+                // For simplicity, assuming Open is quick or we proceed optimistically and GBN will fail if not open.
+                // A more robust way: have a state for "awaitingOpenFileAck".
+                // For now, we'll rely on the existing FT_PACKET_OUT_UUID handler to catch the 0xF1/0xF0.
+                // If 0xF1 03 is received, then we start sending data.
+
+                // Let's make the generic handler for FT_PACKET_OUT_UUID smarter:
+                // (This is a bit of a challenge as notificationHandlers is a single closure per UUID)
+                // Solution: The existing generic handler for FT_PACKET_OUT_UUID needs to check for 0xF1 03.
+                // If it sees it, it then triggers the first call to sendUploadDataPackets.
+                // This is already implicitly handled: if we receive 0xF1 03 (ACK for Open),
+                // the `notificationHandlers[txChar.uuid]` is ALREADY set up for 0x12 (Data ACKs).
+                // So, the flow is:
+                // App sends 0x03 (OpenFile)
+                // FlySight sends 0xF1 03 (ACK for OpenFile) -> this is caught by general FT_Packet_Out handler.
+                // App then starts sending 0x10 (Data Chunks) via sendUploadDataPackets.
+                // FlySight sends 0x12 (ACK for Data Chunk) for each 0x10 -> caught by the specific part of notificationHandler.
+
+                // Initial send after Open command (assuming it will be ACKed and then we can send)
+                // A better way: use a short timeout or a specific callback for the OpenFile ACK.
+                // For now, let's assume the OpenFile command is acknowledged quickly and then start sending.
+                // The actual sending of data packets should start once the OpenFile command is ACKed (0xF1 03).
+                // We can make sendUploadDataPackets conditional on an "isRemoteFileOpen" flag.
+                // This is simplified: we send the Open command and immediately try to send the first window.
+                // The GBN ARQ (ACKs for data packets) will ensure data is only resent if needed.
+                Task {
+                    // Give a slight delay for OpenFile command to be processed and ACKed.
+                    // This is a simplification. A state machine or specific ACK check is more robust.
+                    try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                    if self.isUploading { // Check if still uploading (not cancelled, no immediate NAK)
+                        await self.sendUploadDataPackets(peripheral: peripheral, rxChar: rxChar)
+                    }
                 }
-            } else {
-                print("Received unknown opcode \(requestOpcode) in SP Control Point response: \(data.hexEncodedString())")
             }
+        }
+
+        private func sendUploadDataPackets(peripheral: CBPeripheral, rxChar: CBCharacteristic) async {
+            guard isUploading, let dataToSend = fileDataToUpload else { return }
+
+            // GBN Sender: Send up to `windowLength` packets starting from `nextAckNum`
+            // but not exceeding `nextPacketNum` which has already been sent.
+            // `nextPacketNum` is the next *new* packet to send.
+            // `nextAckNum` is the oldest unacknowledged packet (base of the window).
+
+            // We can send packets from `nextPacketNum` up to `nextAckNum + windowLength -1`
+            while nextPacketNum < (nextAckNum + windowLength) {
+                if let lastSentPacket = lastPacketNum, nextPacketNum >= lastSentPacket {
+                    break // All packets (including final empty one) have been sent.
+                }
+
+                let isFinalPacket = (nextPacketNum * frameLength) >= dataToSend.count
+
+                let packetData: Data
+                var dataChunk = Data()
+
+                if !isFinalPacket {
+                    let startIndex = nextPacketNum * frameLength
+                    let endIndex = min(startIndex + frameLength, dataToSend.count)
+                    dataChunk = dataToSend.subdata(in: startIndex..<endIndex)
+                    packetData = Data([0x10, UInt8(nextPacketNum % 256)]) + dataChunk // Opcode, Counter, Payload
+                } else {
+                    // This is the packet *after* the last actual data, or the first packet if file is empty.
+                    // Send a zero-data-length packet to signify EOF.
+                    packetData = Data([0x10, UInt8(nextPacketNum % 256)]) // Opcode, Counter
+                    print("Upload: Preparing final empty packet #\(nextPacketNum % 256)")
+                    lastPacketNum = nextPacketNum + 1 // Mark that this is the end.
+                }
+
+                // print("Upload: Sending packet #\(nextPacketNum % 256), data length: \(dataChunk.count)")
+                peripheral.writeValue(packetData, for: rxChar, type: .withoutResponse)
+                nextPacketNum += 1
+
+                if isFinalPacket { break } // Sent the EOF marker, stop sending more.
+
+                // Small delay between sends to avoid overwhelming the peripheral's buffer
+                 try? await Task.sleep(nanoseconds: 30_000_000) // 30ms, adjust as needed
+            }
+            // If no ACKs are received, a timeout mechanism (not explicitly implemented here beyond re-sending on next ACK) would trigger retransmission.
+        }
+
+        private func handleUploadCompletion(result: Result<Void, Error>) {
+            DispatchQueue.main.async { // Ensure UI updates and continuation are on main
+                self.uploadContinuation?.resume(with: result)
+                self.uploadContinuation = nil // Clear continuation
+                self.isUploading = false
+                self.fileDataToUpload = nil
+                self.remotePathToUpload = nil
+                self.uploadProgress = (try? result.get()) != nil ? 1.0 : 0.0 // Full progress on success
+
+                // Clear the specific notification handler for FT_Packet_Out if it was only for upload ACKs
+                if let txCharUUID = self.ftPacketOutCharacteristic?.uuid {
+                    // Be careful if FT_Packet_Out is also used for directory listing simultaneously.
+                    // It's generally better to have one robust handler for FT_Packet_Out that routes based on opcode.
+                    // For now, assuming upload is exclusive or the main handler is robust.
+                    // self.notificationHandlers[txCharUUID] = nil; // This might break other FT_Packet_Out uses
+                }
+                print("Upload completed with result: \(result)")
+            }
+        }
+
+        public func cancelUpload() {
+            guard isUploading else { return }
+            print("Cancelling upload...")
+
+            // 1. Send Cancel Transfer command to FlySight
+            if let peripheral = connectedPeripheralInfo?.peripheral, let char = ftPacketInCharacteristic {
+                let cancelCommand = Data([0xFF])
+                peripheral.writeValue(cancelCommand, for: char, type: .withoutResponse)
+                print("Sent Cancel Transfer (0xFF) command to FlySight.")
+            }
+
+            // 2. Update internal state and notify continuation
+            // Must be on main thread if `uploadContinuation` expects it or if it touches @Published vars
+            DispatchQueue.main.async {
+                let error = NSError(domain: "FlySightCore.Upload", code: -999, userInfo: [NSLocalizedDescriptionKey: "Upload cancelled by user."])
+                self.uploadContinuation?.resume(throwing: error) // Resume with cancellation error
+                self.uploadContinuation = nil
+
+                self.isUploading = false
+                self.fileDataToUpload = nil
+                self.remotePathToUpload = nil
+                self.uploadProgress = 0.0
+                // Clear specific handlers if necessary
+                if let txCharUUID = self.ftPacketOutCharacteristic?.uuid {
+                    // self.notificationHandlers[txCharUUID] = nil; // Be cautious here
+                }
+            }
+        }
+
+
+        // MARK: - Ping
+        private func sendPing() {
+            guard let peripheral = connectedPeripheralInfo?.peripheral, let char = ftPacketInCharacteristic else {
+                print("Cannot send ping: Not connected or FT_Packet_In characteristic missing.")
+                return
+            }
+            let pingCommand = Data([0xFE]) // Ping Opcode
+            peripheral.writeValue(pingCommand, for: char, type: .withoutResponse)
+            // print("Ping sent.") // Can be noisy
+        }
+
+        // MARK: - GNSS Data Mask Operations
+        // (Keep existing fetchGNSSMask, updateGNSSMask methods, ensuring they use
+        // connectedPeripheralInfo.peripheral and sdControlPointCharacteristic)
+        public func fetchGNSSMask() {
+            guard let peripheral = connectedPeripheralInfo?.peripheral, let controlChar = sdControlPointCharacteristic else {
+                print("Cannot fetch GNSS mask: Not connected or SD Control Point characteristic.")
+                DispatchQueue.main.async { self.gnssMaskUpdateStatus = .failure("Characteristic not available.") }
+                return
+            }
+            let command = Data([SDControlOpcodes.getMask])
+            print("Fetching GNSS Mask...")
+            DispatchQueue.main.async { self.gnssMaskUpdateStatus = .pending }
+            peripheral.writeValue(command, for: controlChar, type: .withResponse) // .withResponse for CP
+        }
+
+        public func updateGNSSMask(newMask: UInt8) {
+            guard let peripheral = connectedPeripheralInfo?.peripheral, let controlChar = sdControlPointCharacteristic else {
+                print("Cannot update GNSS mask: Not connected or SD Control Point characteristic.")
+                DispatchQueue.main.async { self.gnssMaskUpdateStatus = .failure("Characteristic not available.") }
+                return
+            }
+            self.lastAttemptedGNSSMask = newMask
+            let command = Data([SDControlOpcodes.setMask, newMask])
+            print("Attempting to update GNSS Mask to: \(String(format: "0x%02X", newMask))")
+            DispatchQueue.main.async { self.gnssMaskUpdateStatus = .pending }
+            peripheral.writeValue(command, for: controlChar, type: .withResponse) // .withResponse for CP
+        }
+
+        // MARK: - Data Parsers & Responders
+        // (Keep existing processStartResult, parseLiveGNSSData,
+        // processSDControlPointResponse, processSPControlPointResponse methods)
+        // These methods are generally fine but ensure they are called correctly from didUpdateValueFor.
+        public func processStartResult(data: Data) { // From SP_Result
+            guard data.count == 9 else { print("Invalid start result data length"); return }
+            // ... existing parsing ...
+            let year = data.subdata(in: 0..<2).withUnsafeBytes { $0.load(as: UInt16.self) }
+            // ...
+            DispatchQueue.main.async {
+                // Ensure correct state update based on startPistolState
+                // self.startResultDate = date
+                // self.startPistolState = .idle (if appropriate)
+            }
+        }
+        private func parseLiveGNSSData(from data: Data) { /* ... existing ... */ }
+        private func processSDControlPointResponse(from data: Data) { /* ... existing ... */ }
+        private func processSPControlPointResponse(from data: Data) { /* ... existing ... */ }
+
+        // MARK: - Start Pistol Commands
+        public func sendStartCommand() {
+            guard let peripheral = connectedPeripheralInfo?.peripheral, let spControlChar = spControlPointCharacteristic else {
+                print("SP Control Point characteristic not found or not connected.")
+                return
+            }
+            let startCommand = Data([SPControlOpcodes.startCountdown])
+            peripheral.writeValue(startCommand, for: spControlChar, type: .withResponse) // .withResponse for CP
+            print("Sent Start command to SP Control Point.")
+        }
+
+        public func sendCancelCommand() {
+            guard let peripheral = connectedPeripheralInfo?.peripheral, let spControlChar = spControlPointCharacteristic else {
+                print("SP Control Point characteristic not found or not connected.")
+                return
+            }
+            let cancelCommand = Data([SPControlOpcodes.cancelCountdown])
+            peripheral.writeValue(cancelCommand, for: spControlChar, type: .withResponse) // .withResponse for CP
+            print("Sent Cancel command to SP Control Point.")
+        }
+
+    } // End of BluetoothManager class
+} // End of FlySightCore extension
+
+// MARK: - Helper Enums and Extensions
+public enum BluetoothError: Error, LocalizedError {
+    case notConnectedOrCharsMissing
+    case deallocated
+    case uploadFailed(String)
+    // Add other specific errors
+
+    public var errorDescription: String? {
+        switch self {
+        case .notConnectedOrCharsMissing: return "Not connected to FlySight or essential Bluetooth characteristics are missing."
+        case .deallocated: return "The Bluetooth manager was deallocated."
+        case .uploadFailed(let reason): return "Upload failed: \(reason)"
         }
     }
 }
+// Add for UInt16 if needed for other commands
