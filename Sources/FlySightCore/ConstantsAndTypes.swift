@@ -19,6 +19,19 @@ public extension FlySightCore { // Also extends the FlySightCore enum namespace
         public static let operationFailed: UInt8    = 0x04 // CP_STATUS_OPERATION_FAILED
         public static let operationNotPermitted: UInt8 = 0x05 // CP_STATUS_OPERATION_NOT_PERMITTED
         public static let busy: UInt8               = 0x06 // CP_STATUS_BUSY
+
+        // Moved cpStatusToString here as a static internal method
+        static internal func string(for status: UInt8) -> String {
+            switch status {
+            case FlySightCore.CP_STATUS.success: return "Success"
+            case FlySightCore.CP_STATUS.cmdNotSupported: return "Command Not Supported"
+            case FlySightCore.CP_STATUS.invalidParameter: return "Invalid Parameter"
+            case FlySightCore.CP_STATUS.operationFailed: return "Operation Failed"
+            case FlySightCore.CP_STATUS.operationNotPermitted: return "Operation Not Permitted"
+            case FlySightCore.CP_STATUS.busy: return "Busy"
+            default: return "Unknown Status (0x\(String(format: "%02X", status)))"
+            }
+        }
     }
 
     // Constants for Sensor Data (SD) Control Point Opcodes

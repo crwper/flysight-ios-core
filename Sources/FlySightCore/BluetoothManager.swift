@@ -697,14 +697,47 @@ public extension FlySightCore {
             if characteristic.uuid == FlySightCore.FT_PACKET_IN_UUID {
                 if error == nil {
                     print("Successfully read FT_Packet_In.")
-                    if bondedDeviceIDs.contains(peripheral.identifier) {
-                        if case .discoveringCharacteristics(let p) = connectionState, p.identifier == peripheral.identifier {
-                             handlePostBondingSetup(for: peripheral)
-                        } else if case .connecting(let target) = connectionState, target.id == peripheral.identifier {
+
+                    // Determine if we are in the process of initial connection and discovery for *this* peripheral.
+                    var isInitialSetupPhaseForThisPeripheral = false
+                    if case .discoveringCharacteristics(let p) = connectionState, p.identifier == peripheral.identifier {
+                        isInitialSetupPhaseForThisPeripheral = true
+                    } else if case .connecting(let targetInfo) = connectionState, targetInfo.id == peripheral.identifier {
+                        // This might occur if characteristics are discovered very quickly after connection.
+                        isInitialSetupPhaseForThisPeripheral = true
+                    }
+
+                    if isInitialSetupPhaseForThisPeripheral {
+                        // This successful read was likely the one that triggered OS pairing, or confirms it just completed.
+                        // It's time to finalize the app-level setup.
+                        print("FT_Packet_In read successful during discovery/connection phase for \(peripheral.identifier). Proceeding to post-bonding setup.")
+                        handlePostBondingSetup(for: peripheral)
+                    } else if bondedDeviceIDs.contains(peripheral.identifier) {
+                        // Device is already bonded and not in the initial setup phase.
+                        // This read might be for other purposes or a confirmation on a reconnect.
+                        print("FT_Packet_In read successful for an already bonded device outside initial setup.")
+                        // If already fully connected, ensure critical characteristics are still notifying.
+                        if case .connected = connectionState {
+                            if let ftOut = ftPacketOutCharacteristic, !ftOut.isNotifying {
+                                peripheral.setNotifyValue(true, for: ftOut)
+                                print("Ensured FT_Packet_Out is notifying for already connected device.")
+                            }
+                            // Potentially add other checks here if needed for a fully connected device.
+                        } else {
+                            // It's bonded, but we are not in .connected state.
+                            // This could be a reconnect scenario where we haven't reached .connected yet.
+                            // Try calling handlePostBondingSetup to ensure full setup.
+                            print("FT_Packet_In read for bonded device, but not in .connected state. Attempting post-bonding setup.")
                             handlePostBondingSetup(for: peripheral)
                         }
                     } else {
-                        print("Read FT_Packet_In but device \(peripheral.identifier) is NOT in bondedDeviceIDs. Pairing may have failed system-side.")
+                        // Read was successful, BUT we are not in an initial setup phase for this peripheral,
+                        // AND the device is NOT in our bondedDeviceIDs list.
+                        // This is an unusual state. It implies a successful secure read happened without the app
+                        // being in a clear state to recognize it as the completion of pairing.
+                        // As a best effort, attempt to finalize setup.
+                        print("FT_Packet_In read successful, but in an unexpected state (not initial setup, not yet in bondedDeviceIDs). Attempting post-bonding setup as a fallback.")
+                        handlePostBondingSetup(for: peripheral)
                     }
                 } else {
                     print("Error reading FT_Packet_In (pairing trigger): \(error!.localizedDescription)")
@@ -1353,20 +1386,229 @@ public extension FlySightCore {
         }
 
         // MARK: - Data Parsers & Responders
-        public func processStartResult(data: Data) {
-            guard data.count == 9 else { print("Invalid start result data length"); return }
-            // ... (Your existing parsing logic) ...
-            // For example:
-            // let year = data.subdata(in: 0..<2).withUnsafeBytes { $0.load(as: UInt16.self) }
-            // ...
-            // DispatchQueue.main.async {
-            //     self.startResultDate = ...
-            //     self.startPistolState = .idle
-            // }
+        public func processStartResult(data: Data) { // From SP_Result UUID (00000004-8e22-4541-9d4c-21edae82ed19)
+            guard data.count == 9 else {
+                print("SP_Result: Invalid data length. Expected 9, got \(data.count). Data: \(data.hexEncodedString())")
+                return
+            }
+
+            // Data structure: Year(u16), Mon(u8), Day(u8), Hour(u8), Min(u8), Sec(u8), Hund(u8), TZ(u8)
+            // All fields are Little Endian if multi-byte. Year is u16.
+            // FlySight documentation for SP_RESULT_UUID implies all times are UTC (TZ field is 0 or unused).
+
+            let year: UInt16 = data.subdata(in: 0..<2).withUnsafeBytes { $0.load(as: UInt16.self) }
+            let month: UInt8 = data[2]
+            let day: UInt8 = data[3]
+            let hour: UInt8 = data[4]
+            let minute: UInt8 = data[5]
+            let second: UInt8 = data[6]
+            let hundredths: UInt8 = data[7]
+            // let timezoneOffset: Int8 = data.subdata(in: 8..<9).withUnsafeBytes { $0.load(as: Int8.self) } // Currently unused by FlySight firmware (0)
+
+            var dateComponents = DateComponents()
+            dateComponents.year = Int(year)
+            dateComponents.month = Int(month)
+            dateComponents.day = Int(day)
+            dateComponents.hour = Int(hour)
+            dateComponents.minute = Int(minute)
+            dateComponents.second = Int(second)
+            dateComponents.nanosecond = Int(hundredths) * 10_000_000 // Convert hundredths to nanoseconds
+            dateComponents.timeZone = TimeZone(secondsFromGMT: 0)   // Explicitly UTC
+
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 0)! // Ensure calendar also uses UTC
+
+            if let date = calendar.date(from: dateComponents) {
+                DispatchQueue.main.async {
+                    self.startResultDate = date
+                    self.startPistolState = .idle // Result received, so countdown is over.
+                    print("SP_Result: Parsed start time (UTC): \(date)")
+                }
+            } else {
+                print("SP_Result: Failed to construct date from components: \(dateComponents)")
+            }
         }
-        private func parseLiveGNSSData(from data: Data) { /* ... existing logic ... */ }
-        private func processSDControlPointResponse(from data: Data) { /* ... existing logic ... */ }
-        private func processSPControlPointResponse(from data: Data) { /* ... existing logic ... */ }
+
+        private func parseLiveGNSSData(from data: Data) { // From SD_GNSS_MEASUREMENT_UUID (00000000-8e22-4541-9d4c-21edae82ed19)
+            guard !data.isEmpty else {
+                print("Live GNSS: Received empty data packet.")
+                return
+            }
+
+            let mask = data[0]
+            var offset = 1 // Start reading data after the mask byte
+
+            var tow: UInt32?
+            // var week: UInt16? // Week number not currently sent by firmware as per docs/observation
+            var lon, lat, hMSL: Int32?
+            var velN, velE, velD: Int32?
+            var hAcc, vAcc, sAcc: UInt32?
+            var numSV: UInt8?
+
+            // Time of Week (ms)
+            if (mask & GNSSLiveMaskBits.timeOfWeek) != 0 && data.count >= offset + 4 {
+                tow = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: UInt32.self) }
+                offset += 4
+            }
+
+            // Week Number - Placeholder, FlySight firmware doesn't seem to send this in the live packet.
+            // if (mask & GNSSLiveMaskBits.weekNumber) != 0 && data.count >= offset + 2 {
+            //     week = data.subdata(in: offset..<(offset+2)).withUnsafeBytes { $0.load(as: UInt16.self) }
+            //     offset += 2
+            // }
+
+            // Position (Longitude, Latitude, Height MSL)
+            if (mask & GNSSLiveMaskBits.position) != 0 && data.count >= offset + 12 {
+                lon = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: Int32.self) }
+                offset += 4
+                lat = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: Int32.self) }
+                offset += 4
+                hMSL = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: Int32.self) }
+                offset += 4
+            }
+
+            // Velocity (North, East, Down)
+            if (mask & GNSSLiveMaskBits.velocity) != 0 && data.count >= offset + 12 {
+                velN = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: Int32.self) }
+                offset += 4
+                velE = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: Int32.self) }
+                offset += 4
+                velD = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: Int32.self) }
+                offset += 4
+            }
+
+            // Accuracy (Horizontal, Vertical, Speed)
+            if (mask & GNSSLiveMaskBits.accuracy) != 0 && data.count >= offset + 12 {
+                hAcc = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: UInt32.self) }
+                offset += 4
+                vAcc = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: UInt32.self) }
+                offset += 4
+                sAcc = data.subdata(in: offset..<(offset+4)).withUnsafeBytes { $0.load(as: UInt32.self) }
+                offset += 4
+            }
+
+            // Number of Satellites in Solution
+            if (mask & GNSSLiveMaskBits.numSV) != 0 && data.count >= offset + 1 {
+                numSV = data[offset]
+                offset += 1
+            }
+
+            // Create the LiveGNSSData struct and publish it
+            let gnssData = LiveGNSSData(mask: mask,
+                                        timeOfWeek: tow,
+                                        longitude: lon,
+                                        latitude: lat,
+                                        heightMSL: hMSL,
+                                        velocityNorth: velN,
+                                        velocityEast: velE,
+                                        velocityDown: velD,
+                                        horizontalAccuracy: hAcc,
+                                        verticalAccuracy: vAcc,
+                                        speedAccuracy: sAcc,
+                                        numSV: numSV)
+
+            DispatchQueue.main.async {
+                self.liveGNSSData = gnssData
+            }
+        }
+
+        private func processSDControlPointResponse(from data: Data) { // From SD_CONTROL_POINT_UUID (00000006-8e22-4541-9d4c-21edae82ed19)
+            guard data.count >= 3 else {
+                print("SD Control Point Response: Data too short. \(data.hexEncodedString())")
+                DispatchQueue.main.async {
+                    if self.gnssMaskUpdateStatus == .pending {
+                        self.gnssMaskUpdateStatus = .failure("Invalid response length.")
+                    }
+                }
+                return
+            }
+
+            let responseID = data[0]
+            let originalOpcode = data[1]
+            let status = data[2]
+
+            guard responseID == FlySightCore.CP_RESPONSE_ID else {
+                print("SD Control Point Response: Incorrect response ID. Expected 0xF0, Got \(String(format: "%02X", responseID))")
+                DispatchQueue.main.async {
+                    if self.gnssMaskUpdateStatus == .pending {
+                        self.gnssMaskUpdateStatus = .failure("Invalid response ID.")
+                    }
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                if status == FlySightCore.CP_STATUS.success {
+                    print("SD Control Point: Command 0x\(String(format: "%02X", originalOpcode)) successful.")
+                    if originalOpcode == SDControlOpcodes.getMask {
+                        if data.count >= 4 {
+                            let newMask = data[3]
+                            self.currentGNSSMask = newMask
+                            print("SD Control Point: Successfully fetched GNSS Mask: \(String(format: "0x%02X", newMask))")
+                            self.gnssMaskUpdateStatus = .idle
+                        } else {
+                            print("SD Control Point: GetMask response missing mask value.")
+                            self.gnssMaskUpdateStatus = .failure("GetMask response incomplete.")
+                        }
+                    } else if originalOpcode == SDControlOpcodes.setMask {
+                        if let attemptedMask = self.lastAttemptedGNSSMask {
+                            self.currentGNSSMask = attemptedMask
+                            print("SD Control Point: Successfully set GNSS Mask to: \(String(format: "0x%02X", attemptedMask))")
+                        } else {
+                            print("SD Control Point: SetMask successful, but lastAttemptedGNSSMask was nil. Fetching current mask to confirm.")
+                            self.fetchGNSSMask()
+                            return // Avoid setting to idle before fetch completes.
+                        }
+                        self.gnssMaskUpdateStatus = .idle
+                    } else {
+                        print("SD Control Point: Command 0x\(String(format: "%02X", originalOpcode)) successful (unhandled specific opcode).")
+                        self.gnssMaskUpdateStatus = .idle
+                    }
+                } else {
+                    let errorDescription = FlySightCore.CP_STATUS.string(for: status)
+                    print("SD Control Point: Command 0x\(String(format: "%02X", originalOpcode)) failed. Status: 0x\(String(format: "%02X", status)) (\(errorDescription))")
+                    self.gnssMaskUpdateStatus = .failure("Cmd 0x\(String(format: "%02X", originalOpcode)) fail: \(errorDescription)")
+                }
+                if originalOpcode == SDControlOpcodes.setMask {
+                    self.lastAttemptedGNSSMask = nil
+                }
+            }
+        }
+
+        private func processSPControlPointResponse(from data: Data) { // From SP_CONTROL_POINT_UUID (00000003-8e22-4541-9d4c-21edae82ed19)
+            guard data.count >= 3 else {
+                print("SP Control Point Response: Data too short. \(data.hexEncodedString())")
+                // Potentially update UI if a start/cancel was pending and failed due to bad response
+                return
+            }
+
+            let responseID = data[0]
+            let originalOpcode = data[1]
+            let status = data[2]
+
+            guard responseID == FlySightCore.CP_RESPONSE_ID else {
+                print("SP Control Point Response: Incorrect response ID. Expected 0xF0, Got \(String(format: "%02X", responseID))")
+                return
+            }
+
+            DispatchQueue.main.async {
+                if status == FlySightCore.CP_STATUS.success {
+                    print("SP Control Point: Command 0x\(String(format: "%02X", originalOpcode)) successful.")
+                    if originalOpcode == SPControlOpcodes.startCountdown {
+                        self.startPistolState = .counting
+                    } else if originalOpcode == SPControlOpcodes.cancelCountdown {
+                        self.startPistolState = .idle
+                    }
+                } else {
+                    let errorDescription = FlySightCore.CP_STATUS.string(for: status)
+                    print("SP Control Point: Command 0x\(String(format: "%02X", originalOpcode)) failed. Status: 0x\(String(format: "%02X", status)) (\(errorDescription))")
+                    // If a command failed, typically revert to idle unless the device specifically says it's still busy/counting.
+                    // For simplicity, if a start command fails, we remain idle. If a cancel fails, we might still be counting.
+                    // However, the FlySight usually confirms state via the SP_Result or other means.
+                    // For now, we don't change startPistolState on failure here, relying on other updates or SP_Result.
+                }
+            }
+        }
 
         // MARK: - Start Pistol Commands
         public func sendStartCommand() {
@@ -1388,7 +1630,6 @@ public extension FlySightCore {
             peripheral.writeValue(cancelCommand, for: spControlChar, type: .withResponse)
             print("Sent Cancel command to SP Control Point.")
         }
-
     }
 }
 
